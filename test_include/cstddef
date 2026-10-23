@@ -1,0 +1,5 @@
+#pragma once
+namespace std {
+using size_t = __SIZE_TYPE__;
+enum class byte : unsigned char {};
+}

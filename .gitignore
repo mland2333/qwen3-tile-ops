@@ -1,0 +1,5 @@
+build/
+weights/
+*.bin
+*.elf
+*.o

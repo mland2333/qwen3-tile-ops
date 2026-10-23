@@ -1,0 +1,9 @@
+#pragma once
+#include <cstddef>
+namespace std {
+template<class T, size_t N> struct array {
+  T elems[N];
+  constexpr T &operator[](size_t i) { return elems[i]; }
+  constexpr const T &operator[](size_t i) const { return elems[i]; }
+};
+}
