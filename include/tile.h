@@ -332,43 +332,30 @@ struct Acc {
   }
   // ── 返回值版本（不带尾下划线）───────────────────────────────────────
   // 语义：返回一个新值，*this 不变。
-  // 当前实现 = 真拷贝 + 原地运算（生成 cfg.copy + acopy + 一条 op）；
-  // 后端把 acc 运算改成 untied 指令后，这里会退化成单条指令、不再搬 4 KB。
+  // 实现是"派生值"指令（ISA 的 D 与 S 可以是不同寄存器）：后端在 post-RA
+  // 只补一条 cfg.copy 克隆描述符，**不搬数据**（没有 acopy）。
+  // 唯一的例外是显式 copy()：它就是语义上要一份数据副本。
   // [[nodiscard]] 是关键安全网：写成 `x.mul(k);` 丢掉返回值会被编译器告警。
   [[nodiscard]] YAI_ALWAYS_INLINE Acc add(const Acc &b) const {
-    Acc t = copy();
-    t.add_(b);
-    return t;
+    return Acc(YAI_COMPILER_INTRINSIC(acc_add)(value_, yai_handle(b)));
   }
   [[nodiscard]] YAI_ALWAYS_INLINE Acc sub(const Acc &b) const {
-    Acc t = copy();
-    t.sub_(b);
-    return t;
+    return Acc(YAI_COMPILER_INTRINSIC(acc_sub)(value_, yai_handle(b)));
   }
   [[nodiscard]] YAI_ALWAYS_INLINE Acc mul(const Acc &b) const {
-    Acc t = copy();
-    t.mul_(b);
-    return t;
+    return Acc(YAI_COMPILER_INTRINSIC(acc_mul)(value_, yai_handle(b)));
   }
-  /// 值版本：直接写到一个新寄存器（post-RA 会先克隆 ac 描述符）。
-  /// 没有 4 KB 的数据搬移，只有 1 条 cfg.copy + 1 条运算。
   [[nodiscard]] YAI_ALWAYS_INLINE Acc mul(float value) const {
     return Acc(YAI_COMPILER_INTRINSIC(acc_mul_scalar_val)(value_, value));
   }
   [[nodiscard]] YAI_ALWAYS_INLINE Acc exp() const {
-    Acc t = copy();
-    t.exp_();
-    return t;
+    return Acc(YAI_COMPILER_INTRINSIC(acc_exp_val)(value_));
   }
   [[nodiscard]] YAI_ALWAYS_INLINE Acc mul(const Vec32 &v, bool col = true) const {
-    Acc t = copy();
-    t.mul_(v, col);
-    return t;
+    return Acc(YAI_COMPILER_INTRINSIC(acc_mul_vec_val)(value_, yai_handle(v), col));
   }
   [[nodiscard]] YAI_ALWAYS_INLINE Acc sub(const Vec32 &v, bool col = true) const {
-    Acc t = copy();
-    t.sub_(v, col);
-    return t;
+    return Acc(YAI_COMPILER_INTRINSIC(acc_sub_vec_val)(value_, yai_handle(v), col));
   }
   [[nodiscard]] YAI_ALWAYS_INLINE Acc add(float value) const {
     return Acc(YAI_COMPILER_INTRINSIC(acc_add_scalar_val)(value_, value));
@@ -558,31 +545,22 @@ struct Vec32 {
   YAI_ALWAYS_INLINE void add_(float value) {
     YAI_COMPILER_INTRINSIC(vec32_add_scalar)(value_, value);
   }
-  // ── 返回值版本（不带尾下划线），语义同 Acc ──
+  // ── 返回值版本（不带尾下划线），语义同 Acc：
+  //    派生值指令（D != S），post-RA 只补 cfg.copy，不搬 128 B 数据 ──
   [[nodiscard]] YAI_ALWAYS_INLINE Vec32 add(const Vec32 &b) const {
-    Vec32 t = copy();
-    t.add_(b);
-    return t;
+    return Vec32(YAI_COMPILER_INTRINSIC(vec32_add_val)(value_, yai_handle(b)));
   }
   [[nodiscard]] YAI_ALWAYS_INLINE Vec32 mul(const Vec32 &b) const {
-    Vec32 t = copy();
-    t.mul_(b);
-    return t;
+    return Vec32(YAI_COMPILER_INTRINSIC(vec32_mul_val)(value_, yai_handle(b)));
   }
   [[nodiscard]] YAI_ALWAYS_INLINE Vec32 exp() const {
-    Vec32 t = copy();
-    t.exp_();
-    return t;
+    return Vec32(YAI_COMPILER_INTRINSIC(vec32_exp_val)(value_));
   }
   [[nodiscard]] YAI_ALWAYS_INLINE Vec32 sub(const Vec32 &b) const {
-    Vec32 t = copy();
-    t.sub_(b);
-    return t;
+    return Vec32(YAI_COMPILER_INTRINSIC(vec32_sub_val)(value_, yai_handle(b)));
   }
   [[nodiscard]] YAI_ALWAYS_INLINE Vec32 mul(float value) const {
-    Vec32 t = copy();
-    t.mul_(value);
-    return t;
+    return Vec32(YAI_COMPILER_INTRINSIC(vec32_mul_scalar_val)(value_, value));
   }
 
   YAI_ALWAYS_INLINE void mul_(float value) {
@@ -689,9 +667,8 @@ YAI_ALWAYS_INLINE Acc sub(const Acc &a, const Acc &b) {
 YAI_ALWAYS_INLINE Acc mul(const Acc &a, const Acc &b) {
   return Acc(YAI_COMPILER_INTRINSIC(acc_mul)(yai_handle(a), yai_handle(b)));
 }
-YAI_ALWAYS_INLINE Acc div(const Acc &a, const Acc &b) {
-  return Acc(YAI_COMPILER_INTRINSIC(acc_div)(yai_handle(a), yai_handle(b)));
-}
+// 注意：ISA 已删除 div（只有 rcp.approx / rsqrt.approx / exp2.approx），
+// 所以这里不提供 div()/operator/；需要倒数请用 Acc::rcp_()/rcp_refine_()。
 YAI_ALWAYS_INLINE Acc operator+(const Acc &a, const Acc &b) {
   return add(a, b);
 }
@@ -700,9 +677,6 @@ YAI_ALWAYS_INLINE Acc operator-(const Acc &a, const Acc &b) {
 }
 YAI_ALWAYS_INLINE Acc operator*(const Acc &a, const Acc &b) {
   return mul(a, b);
-}
-YAI_ALWAYS_INLINE Acc operator/(const Acc &a, const Acc &b) {
-  return div(a, b);
 }
 
 #undef YAI_COMPILER_INTRINSIC

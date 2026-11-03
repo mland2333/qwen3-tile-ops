@@ -89,6 +89,7 @@ make data      # 全量：build/full/{model_big.h, qwen3_big_data.bin, ref.npz}
 make big       # 编译 + 链接 build/qwen3_full.bin
 make check     # 跑到模拟器上，逐 stage 与 numpy 参考对比
 make small     # 1 层 / 1024 词表的冒烟测试（~30 MB blob，10 秒）
+make value-ops # Acc/Vec32 值形式 vs 显式拷贝的逐位对比（不需要模型）
 make chat TEXT="你好，请用一句话介绍你自己。" MAX_NEW=8
 ```
 
@@ -114,7 +115,7 @@ make chat TEXT="你好，请用一句话介绍你自己。" MAX_NEW=8
 * 设备上 6 个 token 的文本 `<think>\n好的，，我…` 与仓库迁移前记录的验证结果
   逐 token 一致。
 
-运行时：32 token prefill 2,370,235 条指令（模拟器约 10 s，不含 791 MB dump）；
+运行时：32 token prefill 2,369,787 条指令（模拟器约 10 s，不含 791 MB dump）；
 `build/qwen3_full.bin` 约 168 KB；`make data` 约 40 s（含参考前向）。
 
 ## blob 布局（`tools/pqwf.py` 生成，与 `config/model_big.h` 一致）
@@ -140,6 +141,29 @@ kH..   激活/scale/量化缓冲 + 每层一份 KV cache（max_seq×kv_width i8 
 * KV cache 是**每层一份**（`kKV_BASE + layer*kKV_STRIDE`）；
 * `q8/qs/o` 的第 0 行在算最后一行 logits 时被复用为 final-norm 的输出，
   `compare.py` 对这三处做了别名说明。
+
+## 值传递 API（D ≠ S，不搬数据）
+
+`tile.h` 里带尾下划线的是原地版本，不带下划线的是**派生值**版本。派生值版本现在
+走 ISA 的 D≠S 形态：后端在 post-RA 只补一条 `cfg.copy`（克隆 base/stride/zone/
+dtype），**不发 `acopy`/`vcopy`**：
+
+| 表达式 | 生成 | 数据搬运 |
+|---|---|---|
+| `Acc t = x.mul(k)` / `x.add(k)` | `cfg.copy` + `amulx`/`aaddx` | 无 |
+| `Acc t = x.add(y)`（含 `x + y`） | `cfg.copy` + `aadd` | 无 |
+| `Acc t = x.sub(y)` / `x.mul(y)`（含 `-`、`*`） | `cfg.copy` + `asub`/`amul` | 无 |
+| `Acc t = x.mul(v, byrow/bycol)` / `x.sub(v, ...)` | `cfg.copy` + `amulv`/`asubv` | 无 |
+| `Acc t = x.exp()` | `cfg.copy` + `amulx` + `aexp2` | 无 |
+| `Vec32 t = u.add(v)` / `sub` / `mul` | `cfg.copy` + `vadd`/`vsub`/`vmul` | 无 |
+| `Vec32 t = u.exp()` | `cfg.copy` + `vmulx` + `vexp2` | 无 |
+| `Vec32 t = u.mul(k)` | `cfg.copy` + `vmulx` | 无 |
+| `Acc/Vec32 t = x.copy()` | `cfg.copy` + `acopy`/`vcopy` | 是（语义就是要副本） |
+
+`make value-ops` 是这套语义的回归：14 个 case 各自算“值形式”和“copy+原地”，
+逐位相同且与 numpy 一致（不需要模型，1 秒跑完）。attention 里原来的
+`corr.copy(maximum); corr.sub_(nmm)` 已改成 `Vec32 corr = maximum.sub(nmm)`，
+prefill 32 的指令数因此 2,370,235 → **2,369,787**（每 KV 块省 1 条 `vcopy`）。
 
 ## 本轮修复的编译器编码错误
 

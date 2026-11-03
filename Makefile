@@ -38,7 +38,7 @@ TARGET  := --target=riscv64-unknown-elf -march=rv64im_xaicore -mabi=lp64 \
 INC     := -I include -I $(VDIR) -I config
 KERNELS := $(wildcard kernels/*.h)
 
-.PHONY: all data big bridge check chat small clean help
+.PHONY: all data big bridge check chat small value-ops clean help
 
 all: big
 
@@ -94,6 +94,19 @@ check: $(GUEST) $(BRIDGE) $(DATA) $(REF) $(HDR)
 small:
 	$(MAKE) VARIANT=small CONVERT_ARGS="--layers 1 --vocab 1024 --n-prompt 40 --n-gen 2" \
 	        data big check
+
+# ---- value-form (no-copy) guest test --------------------------------------
+$(BUILD)/value_ops.bin: tests/guest/value_ops.cpp include/tile.h $(BUILD)/crt0.o
+	@mkdir -p $(BUILD)
+	$(CLANG) $(TARGET) $(INC) -c $< -o $(BUILD)/value_ops_main.o
+	$(CROSS)objcopy --remove-section=.riscv.attributes $(BUILD)/value_ops_main.o \
+	    $(BUILD)/value_ops_main.o.link
+	$(CROSS)ld -T $(LINK_LD) $(BUILD)/value_ops_main.o.link $(BUILD)/crt0.o \
+	    -o $(BUILD)/value_ops.elf
+	$(CROSS)objcopy -O binary $(BUILD)/value_ops.elf $@
+
+value-ops: $(BUILD)/value_ops.bin $(BRIDGE)
+	python3 tools/check_value_ops.py --guest $(BUILD)/value_ops.bin --bridge $(BRIDGE)
 
 # ---- text in / text out ----------------------------------------------------
 chat: $(GUEST) $(BRIDGE) $(HDR) $(DATA)

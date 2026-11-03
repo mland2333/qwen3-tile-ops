@@ -271,10 +271,9 @@ YAI_OP_INLINE void attention_head_hd128_blocks(
     // 等后端给运算加上 def 之后，链条才会变成 0 拷贝。
     Vec32 nmm = s.row_max();
     nmm.max_(maximum);
-    // 试验：不用值版本（内部走 vec32_copy 的 def 形态），改用原地 copy
-    Vec32 corr{};
-    corr.copy(maximum);   // cfg.copy + vcopy（已验证的正确形态）
-    corr.sub_(nmm);
+    // corr 是派生值，直接用值形式：maximum - nmm 写到新寄存器（post-RA 只补
+    // 一条 cfg.copy，不搬 128 B 数据）；随后在 corr 上原地 exp。
+    Vec32 corr = maximum.sub(nmm);
     corr.exp_();
     den.mul_(corr);
     r0.mul_(corr, true);
