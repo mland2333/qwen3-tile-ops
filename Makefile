@@ -1,89 +1,104 @@
-# 独立的 tiny Qwen3 推理项目。
+# Tile-NPU Qwen3 operator library: build the guest, the blob and the checks.
 #
-# 依赖：本仓库的 YAI clang（默认 ../build/bin/clang++）、
-# riscv64-unknown-elf 工具链、Tile-NPU-Sim 的 guest link.ld。
-# 可用变量覆盖：CLANG / CROSS / LINK_LD / NPUCC / TILE_NPU_SIM。
+# Dependencies:
+#   * clang++ with the XAIcore extension   (CLANG, default ../llvm-project/build/bin/clang++)
+#   * riscv64-unknown-elf binutils         (CROSS)
+#   * a built Tile-NPU-Sim                 (TILE_NPU_SIM, for libsim_core.a)
+#
+# Common flows:
+#   make data            # full 0.6B: build/<variant>/model_big.h + blob + reference
+#   make big             # compile+link the guest against the current header
+#   make check           # run the guest on the simulator and diff every stage
+#   make small           # 1 layer / 1024 vocab smoke test (~30 MB blob)
+#   make chat TEXT="..." # text in / text out (greedy, on the device)
+#
+# Variables: CLANG, CROSS, LINK_LD, TILE_NPU_SIM, VARIANT, CONVERT_ARGS.
 
-CLANG     ?= ../build/bin/clang++
-CROSS     ?= riscv64-unknown-elf-
-LINK_LD   ?= $(HOME)/Tile-NPU-Sim/tests/guest/link.ld
+CLANG        ?= ../llvm-project/build/bin/clang++
+CROSS        ?= riscv64-unknown-elf-
+TILE_NPU_SIM ?= ../Tile-NPU-Sim
+SIM_LIB      := $(TILE_NPU_SIM)/build/linux/x86_64/release/libsim_core.a
+LINK_LD      ?= link.ld
 
-# x31 = blob 基址、x30 = 栈顶：由 sim_bridge/crt0 约定传入，编译器不得挪用，
-# 否则 main 里 asm("mv %0, x31") 可能读到被清零的 x31（96 token 时实测踩过）。
-TARGET    := --target=riscv64-unknown-elf -march=rv64im_xaicore -mabi=lp64 \
-             -ffixed-x30 -ffixed-x31 \
-             -std=c++20 -O1 -nostdinc++ -isystem test_include
-INC       := -I include
-BUILD     := build
-KERNELS   := $(wildcard kernels/*.h)
+BUILD   := build
+VARIANT ?= full
+VDIR    := $(BUILD)/$(VARIANT)
+HDR     := $(VDIR)/model_big.h
+DATA    := $(VDIR)/qwen3_big_data.bin
+REF     := $(VDIR)/ref.npz
+OUT     := $(VDIR)/out.bin
+GUEST   := $(BUILD)/qwen3_$(VARIANT).bin
+OBJECT  := $(BUILD)/main_$(VARIANT).o
+BRIDGE  := $(BUILD)/sim_bridge
 
-.PHONY: all weights check small check-small big big-data check-big clean
+# x31 = blob base, x30 = stack top: fixed by the sim_bridge/crt0 convention, so
+# the compiler must not allocate them.
+TARGET  := --target=riscv64-unknown-elf -march=rv64im_xaicore -mabi=lp64 \
+           -ffixed-x30 -ffixed-x31 -std=c++20 -O1 -nostdinc++ -isystem test_include
+INC     := -I include -I $(VDIR) -I config
+KERNELS := $(wildcard kernels/*.h)
 
-all: $(BUILD)/qwen3_guest.bin
+.PHONY: all data big bridge check chat small clean help
 
-$(BUILD):
-	mkdir -p $(BUILD)
+all: big
 
-$(BUILD)/main.o: src/main.cpp $(KERNELS) include/tile.h | $(BUILD)
+help:
+	@sed -n '2,17p' Makefile
+
+# ---- model blob, header and numpy reference --------------------------------
+# Grouped targets: one converter run produces all three. Delete build/<variant>
+# to force a regeneration (e.g. after changing CONVERT_ARGS).
+$(DATA) $(REF) $(HDR) &: tools/convert_pqwf.py tools/pqwf.py tools/ref_qwen3.py
+	python3 tools/convert_pqwf.py --header $(HDR) --blob $(DATA) --ref $(REF) $(CONVERT_ARGS)
+
+data: $(DATA)
+
+# ---- guest ----------------------------------------------------------------
+$(OBJECT): src/main_big.cpp $(KERNELS) include/tile.h $(HDR)
+	@mkdir -p $(BUILD)
 	$(CLANG) $(TARGET) $(INC) -c $< -o $@
+	# binutils older than the target clang rejects the `zmmul`/`xaicore`
+	# attributes clang 21 emits; the linker script discards them anyway.
+	$(CROSS)objcopy --remove-section=.riscv.attributes $@ $@.link
 
-$(BUILD)/crt0.o: src/crt0.S | $(BUILD)
+$(BUILD)/crt0.o: src/crt0.S
+	@mkdir -p $(BUILD)
 	$(CROSS)as -mabi=lp64 $< -o $@
 
-$(BUILD)/qwen3_guest.elf: $(BUILD)/main.o $(BUILD)/crt0.o
-	$(CROSS)ld -T $(LINK_LD) $^ -o $@
+$(GUEST): $(OBJECT) $(BUILD)/crt0.o
+	$(CROSS)ld -T $(LINK_LD) $(OBJECT).link $(BUILD)/crt0.o -o $(BUILD)/qwen3_$(VARIANT).elf
+	$(CROSS)objcopy -O binary $(BUILD)/qwen3_$(VARIANT).elf $@
+	@echo "guest: $@ ($$(stat -c%s $@) bytes)"
 
-$(BUILD)/qwen3_guest.bin: $(BUILD)/qwen3_guest.elf
-	$(CROSS)objcopy -O binary $< $@
-	@echo "guest: $@"
+big: $(GUEST)
 
-weights: | $(BUILD)
-	python3 tools/build_weights.py --pqwf $(BUILD)/tiny_qwen3_mh.pqw \
-	                               --blob $(BUILD)/tiny_qwen3_mh.bin
+# ---- simulator bridge ------------------------------------------------------
+$(SIM_LIB):
+	@echo "missing $(SIM_LIB): build Tile-NPU-Sim first (xmake in $(TILE_NPU_SIM))" >&2
+	@false
 
-check: all weights
-	python3 tools/run_check.py --guest $(BUILD)/qwen3_guest.bin \
-	                           --blob $(BUILD)/tiny_qwen3_mh.bin
+$(BRIDGE): tools/sim_bridge.cpp $(SIM_LIB)
+	@mkdir -p $(BUILD)
+	g++ -std=c++20 -O2 -I $(TILE_NPU_SIM)/include -I $(TILE_NPU_SIM)/src \
+	    tools/sim_bridge.cpp $(SIM_LIB) -o $@
+	@echo "bridge: $@"
 
-SMALL_BIN  := $(BUILD)/qwen3_small.bin
-SMALL_HDR  := $(BUILD)/model_small.h
-SMALL_DATA := $(BUILD)/qwen3_small_data.bin
+bridge: $(BRIDGE)
 
-$(SMALL_HDR): tools/qwen3_small.py | $(BUILD)
-	python3 tools/qwen3_small.py --header $@ --blob $(SMALL_DATA)
+# ---- run + per-stage comparison -------------------------------------------
+check: $(GUEST) $(BRIDGE) $(DATA) $(REF) $(HDR)
+	./$(BRIDGE) $(GUEST) $(DATA) $(OUT)
+	python3 tools/compare.py --header $(HDR) --out $(OUT) --ref $(REF)
 
-$(BUILD)/main_small.o: src/main_small.cpp $(KERNELS) $(SMALL_HDR) | $(BUILD)
-	$(CLANG) $(TARGET) $(INC) -I $(BUILD) -c $< -o $@
+# ---- small end-to-end smoke test ------------------------------------------
+small:
+	$(MAKE) VARIANT=small CONVERT_ARGS="--layers 1 --vocab 1024 --n-prompt 40 --n-gen 2" \
+	        data big check
 
-$(SMALL_BIN): $(BUILD)/main_small.o $(BUILD)/crt0.o
-	$(CROSS)ld -T $(LINK_LD) $^ -o $(BUILD)/qwen3_small.elf
-	$(CROSS)objcopy -O binary $(BUILD)/qwen3_small.elf $@
-	@echo "small guest: $@"
-
-small: $(SMALL_BIN)
-
-check-small: small $(SMALL_DATA)
-	python3 tools/run_check_small.py --guest $(SMALL_BIN) --blob $(SMALL_DATA) --seed 1
-
-BIG_BIN  := $(BUILD)/qwen3_big.bin
-BIG_HDR  := $(BUILD)/model_big.h
-BIG_DATA := $(BUILD)/qwen3_big_data.bin
-
-$(BIG_HDR) $(BIG_DATA): tools/convert_pqwf.py | $(BUILD)
-	python3 tools/convert_pqwf.py --header $(BIG_HDR) --blob $(BIG_DATA)
-
-$(BUILD)/main_big.o: src/main_big.cpp $(KERNELS) $(BIG_HDR) | $(BUILD)
-	$(CLANG) $(TARGET) $(INC) -I $(BUILD) -c $< -o $@
-
-$(BIG_BIN): $(BUILD)/main_big.o $(BUILD)/crt0.o
-	$(CROSS)ld -T $(LINK_LD) $^ -o $(BUILD)/qwen3_big.elf
-	$(CROSS)objcopy -O binary $(BUILD)/qwen3_big.elf $@
-	@echo "big guest: $@"
-
-big: $(BIG_BIN)
-big-data: $(BIG_HDR) $(BIG_DATA)
-check-big: big big-data
-	python3 tools/run_big.py --guest $(BIG_BIN) --blob $(BIG_DATA)
+# ---- text in / text out ----------------------------------------------------
+chat: $(GUEST) $(BRIDGE) $(HDR) $(DATA)
+	python3 tools/run_chat.py "$(TEXT)" --max-new $(or $(MAX_NEW),8) \
+	        --header $(HDR) --blob $(DATA) --guest $(GUEST) --bridge $(BRIDGE)
 
 clean:
 	rm -rf $(BUILD)

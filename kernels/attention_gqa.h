@@ -96,16 +96,24 @@ YAI_OP_INLINE void attention_head_hd(const MatrixView &q8,
                     static_cast<std::uint8_t>(kBlock));
   s.quant_ext(ps, pt);
 
-  // ---- 6) O = P·V，每 32 维输出块一条 mma.nn ----
+  // ---- 6) O = P·Vᵀ，每 32 维输出块一条 mma.nt ----
+  // 右操作数必须是 Vᵀ（[hd][kv]）：用转置视图（row_bytes=1、col_bytes=原行跨步）
+  // 按块载入。den 的倒数在循环外算一次（循环内会把它再倒一次）。
+  const std::uint32_t kv = v8.rows;
+  const MatrixView vT{v8.data, 1, v8.row_bytes,
+                      static_cast<std::uint32_t>(v8.cols), kv, v8.dtype};
+  const std::uint8_t nc = block_zone(kv, 0);
+  den.rcp_();
   for (std::uint32_t n = 0; n < v8.cols; n += kBlock) {
     Tile vt{};
-    load_tile(vt, v8, 0, n);
+    config_tile(vt, vT);
+    set_zone(vt, block_zone(vT.rows, n), nc);
+    load_tile_at(vt, vT.data + n);
     Acc o{};
     init_i32_acc(o, static_cast<std::uint8_t>(rows), block_zone(v8.cols, n));
-    pt.matmul(vt, o, /*zero=*/true, /*lt=*/false, /*rt=*/false);
+    pt.matmul(vt, o, /*zero=*/true, /*lt=*/false, /*rt=*/true);
     o.to_fp32_();
     o.mul_(ps, true);
-    den.rcp_();
     o.mul_(den, true);
     store_acc(o, out, 0, n);
   }
@@ -136,9 +144,7 @@ YAI_OP_INLINE void attention_heads_gqa(const MatrixView &q8,
     const std::uint32_t hd = static_cast<std::uint32_t>(head_dim);
     attention_head_hd(sub_view(q8, 0, qc, q8.rows, hd),
                       sub_view(k8, 0, kvc, k8.rows, hd),
-                      // V 用转置视图（[hd][kv]）：row_bytes=1、col_bytes=原行跨步
-                      MatrixView{v8.data + static_cast<std::size_t>(kvc) * static_cast<std::size_t>(v8.col_bytes),
-                                 1, v8.row_bytes, hd, v8.rows, v8.dtype},
+                      sub_view(v8, 0, kvc, v8.rows, hd),
                       sub_view(q_scale, qs0, 0, q8.rows, 1),
                       sub_view(k_scale, ks0, 0, k8.rows, 1),
                       sub_view(v_scale, ks0, 0, v8.rows, 1),

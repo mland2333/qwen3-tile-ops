@@ -15,7 +15,7 @@
 //                                areduce.rows.max / vsub / vexp2 / areduce.rows.sum / vdiv
 //   S   *= v_scale(bycol)        amulv.bycol    —— 把 V 的量化 scale 折进权重
 //   P    = 量化(S)               areduce.rows.absmax → vmulx(1/127) → tquantx
-//   O    = P · V                 mma.nn.zero.i8.i32
+//   O    = P · Vᵀ                mma.nt.zero.i8.i32（ISA 只保留 nt）
 //   O   *= p_scale(byrow)        amulv.byrow    —— 反量化
 //
 // 为什么 V 的 scale 能折进 softmax 权重：O = Σ_j P_j * v8_j * vscale_j，
@@ -38,13 +38,11 @@ YAI_OP_INLINE void attention_head(const MatrixView &q8, const MatrixView &k8,
                                       const MatrixView &k_scale,
                                       const MatrixView &v_scale,
                                       const MatrixView &out, bool causal) {
-  // ---- 1) 载入 q/k/v 三个 tile（都是 32x32 i8）----
+  // ---- 1) 载入 q/k 两个 tile；V 按转置视图载入（见第 9 步）----
   Tile qt{};
   Tile kt{};
-  Tile vt{};
   load_tile(qt, q8, 0, 0);
   load_tile(kt, k8, 0, 0);
-  load_tile(vt, v8, 0, 0);
   // ---- 2) 三条 per-token scale 向量 ----
   Vec32 qs{};
   Vec32 ks{};
@@ -84,10 +82,18 @@ YAI_OP_INLINE void attention_head(const MatrixView &q8, const MatrixView &k8,
   ps.mul_(kInv127);
   s.quant_ext(ps, qt);       // P 写回 qt（qt 已经用完）
 
-  // ---- 9) O = P·V（nn：都不转置），再乘 P 的行 scale 反量化 ----
+  // ---- 9) O = P·Vᵀ，再乘 P 的行 scale 反量化 ----
+  // ISA 只保留 mma.nt（D[m,n] = Σ_k A[m,k]·B[n,k]），所以右操作数要按 [n][k]
+  // 存放：PV 的 B 是 Vᵀ。用一个转置视图（row_bytes=1、col_bytes=原行跨步）
+  // 把 V[kv][hd] 当成 [hd][kv] 载入，块内就是 Vᵀ。
+  const std::uint32_t kv = v8.rows;
+  const MatrixView vT{v8.data, 1, v8.row_bytes,
+                      static_cast<std::uint32_t>(v8.cols), kv, v8.dtype};
+  Tile vt{};
+  load_tile(vt, vT, 0, 0);
   Acc o{};
-  init_i32_acc(o, block_zone(q8.rows, 0), block_zone(v8.cols, 0));
-  qt.matmul(vt, o, /*zero=*/true, /*lt=*/false, /*rt=*/false);
+  init_i32_acc(o, block_zone(q8.rows, 0), block_zone(vT.rows, 0));
+  qt.matmul(vt, o, /*zero=*/true, /*lt=*/false, /*rt=*/true);
   o.to_fp32_();
   o.mul_(ps, true);
   store_acc(o, out, 0, 0);
