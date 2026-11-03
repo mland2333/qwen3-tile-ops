@@ -44,21 +44,23 @@ YAI_OP_INLINE void rmsnorm_rows(const MatrixView &x, const MatrixView &w,
     const std::uint8_t nr = block_zone(x.rows, m);
     // ---- 第一遍：整行平方和 ----
     Vec32 ss{};
+    // 只用 merge 形式（vec += reduce(acc)）：先显式配好 dtype 与 len，
+    // 否则 merge 会从目标向量的描述符拷贝出一份未配置的配置。
+    ss.set_dtype(Vec32DType::F32);
+    set_len(ss, nr);
+    ss.fill(0.0f);
     #pragma clang loop YAI_LOOP_UNROLL
     for (std::uint32_t k = 0; k < x.cols; k += kBlock) {
       set_zone(b, nr, block_zone(x.cols, k));
       load_acc_at(b, x.data + m * static_cast<std::uint32_t>(x.row_bytes) +
                      k * static_cast<std::uint32_t>(x.col_bytes));
-      if (k == 0) {
-        ss = b.row_sum_sq();
-      } else {
-        b.row_sum_sq(ss);
-      }
+      // 统一用 merge 形式（ss += 行平方和），ss 已在循环外清零并配好 len。
+      b.row_sum_sq(ss);
     }
     // ---- 缩放系数：mean → +eps → rsqrt（只用一条 vrsqrt，与参考同式子）----
-    ss.mul(inv);
-    ss.add(kEps);
-    ss.rsqrt();
+    ss.mul_(inv);
+    ss.add_(kEps);
+    ss.rsqrt_();
 
     // ---- 第二遍：先按行缩放，再按列乘 weight，写回 ----
     #pragma clang loop YAI_LOOP_UNROLL
@@ -70,8 +72,8 @@ YAI_OP_INLINE void rmsnorm_rows(const MatrixView &x, const MatrixView &w,
       // weight：长度只依赖块宽，地址随 k 走
       set_len(wv, nc);
       load_vec_at(wv, w.data + k * static_cast<std::uint32_t>(w.row_bytes));
-      b.mul(ss, true);
-      b.mul(wv, false);
+      b.mul_(ss, true);
+      b.mul_(wv, false);
       store_acc_at(b, out.data + m * static_cast<std::uint32_t>(out.row_bytes) +
                       k * static_cast<std::uint32_t>(out.col_bytes));
     }

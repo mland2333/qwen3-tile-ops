@@ -57,7 +57,7 @@ YAI_OP_INLINE void quant_rows(const MatrixView &x, const MatrixView &qi8,
       }
     }
     // ---- scale = absmax/127，写回（只写 nr 个 lane）----
-    sv.mul(kInv127);
+    sv.mul_(kInv127);
     set_len(sv, nr);
     store_vec_at(sv, scale.data + m * static_cast<std::uint32_t>(scale.row_bytes));
 

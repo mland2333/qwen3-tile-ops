@@ -59,36 +59,37 @@ YAI_OP_INLINE void attention_head(const MatrixView &q8, const MatrixView &k8,
   qt.matmul(kt, s, /*zero=*/true, /*lt=*/false, /*rt=*/true);
 
   // ---- 4) 转 f32，乘 Q/K 两个量化 scale ----
-  s.to_fp32();
-  s.mul(qs, true);
-  s.mul(ks, false);
+  s.to_fp32_();
+  s.mul_(qs, true);
+  s.mul_(ks, false);
 
   // ---- 5) 因果 mask：保留 j <= i（tril），上三角填 -inf ----
   if (causal) {
-    s.mask(0);
+    s.mask_(0);
   }
 
   // ---- 6) softmax（减行最大值 → exp2 → 除行和）----
   Vec32 m = s.row_max();
-  s.sub(m, true);
-  s.exp();
+  s.sub_(m, true);
+  s.exp_();
   Vec32 den = s.row_sum();
-  s.div(den, true);
+  den.rcp_();
+  s.mul_(den, true);
 
   // ---- 7) 折叠 V 的 scale（见文件头说明）----
-  s.mul(vs, false);
+  s.mul_(vs, false);
 
   // ---- 8) 把 P 量化成 i8（每个 query 行一个 scale）----
   Vec32 ps = s.row_absmax();
-  ps.mul(kInv127);
+  ps.mul_(kInv127);
   s.quant_ext(ps, qt);       // P 写回 qt（qt 已经用完）
 
   // ---- 9) O = P·V（nn：都不转置），再乘 P 的行 scale 反量化 ----
   Acc o{};
   init_i32_acc(o, block_zone(q8.rows, 0), block_zone(v8.cols, 0));
   qt.matmul(vt, o, /*zero=*/true, /*lt=*/false, /*rt=*/false);
-  o.to_fp32();
-  o.mul(ps, true);
+  o.to_fp32_();
+  o.mul_(ps, true);
   store_acc(o, out, 0, 0);
 }
 

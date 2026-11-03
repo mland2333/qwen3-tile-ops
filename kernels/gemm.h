@@ -52,11 +52,11 @@ YAI_ALWAYS_INLINE void gemm_one_n_block(const MatrixView &a, const MatrixView &b
                          k * static_cast<std::uint32_t>(b.col_bytes));
     ta.matmul(tb, o, /*zero=*/false, /*lt=*/false, /*rt=*/true);
   }
-  o.to_fp32();
-  o.mul(as, true);
+  o.to_fp32_();
+  o.mul_(as, true);
   Vec32 ws{};
   load_vec_n(ws, b_scale, n, block_zone(b.rows, n));
-  o.mul(ws, false);
+  o.mul_(ws, false);
   store_acc(o, out, m, n);
 }
 
@@ -65,10 +65,10 @@ YAI_ALWAYS_INLINE void gemm_epilogue_block(const Vec32 &as, Vec32 &ws,
                                            Acc &o, const MatrixView &b_scale,
                                            const MatrixView &out,
                                            std::uint32_t m, std::uint32_t n) {
-  o.to_fp32();
-  o.mul(as, true);
+  o.to_fp32_();
+  o.mul_(as, true);
   ws.load();                            // 描述符自增（len*stride）指向下一个 n 块
-  o.mul(ws, false);
+  o.mul_(ws, false);
   // acc 的 strides 已按 out 配好（与位置无关），这里只写 base_addr
   store_acc_at(o, out.data + m * static_cast<std::uint32_t>(out.row_bytes) +
                       n * static_cast<std::uint32_t>(out.col_bytes));

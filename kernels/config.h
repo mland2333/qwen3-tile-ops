@@ -72,7 +72,7 @@ inline constexpr float kInv127 = 1.0f / 127.0f;
 //
 // 乘的顺序很重要：先乘 Q 的 per-token scale（byrow）、再乘 K 的（bycol）、
 // 最后乘这个常量，然后才 mask。这与 host 参考 qwen3_by_tile.cpp::attention
-// 里的 `score.mul(1.f / std::sqrt(float(HD)))` 表达式逐位对齐。
+// 里的 `score.mul_(1.f / std::sqrt(float(HD)))` 表达式逐位对齐。
 //
 // 为什么不现场算：设备端没有 sqrt（ISA 只有 vrsqrt.approx），而这个值在
 // 编译期就确定，所以按常用 head_dim 直接给常量表。

@@ -206,6 +206,20 @@ struct Acc {
       : value_(YAI_COMPILER_INTRINSIC(acc_create)()) {}
   YAI_ALWAYS_INLINE explicit Acc(AccValue value) : value_(value) {}
 
+  // 拷贝构造/赋值必须发真正的 acopy。
+  //
+  // 为什么需要显式写：acc 的机器指令全部是"目的寄存器只作 use、硬件原地写"，
+  // 所以 SSA 里源值永远不会被重新定义，默认的按值拷贝会被优化器折叠掉，
+  // `Acc t = x;` 实际得到的是同一物理寄存器（别名），改 t 会连带改坏 x。
+  // 这里把拷贝显式降到 acc_copy（acopy + cfg.copy），让 C++ 的值语义成立。
+  // 禁止隐式拷贝/赋值：`Acc t = x;` 在"指令原地写、IR 无 def"的模型下会被
+  // 优化成别名（两个名字同一个物理寄存器），改一个会静默改坏另一个。
+  // 要拷贝请显式调用 copy()；要原地算请用带下划线的方法。
+  Acc(const Acc &) = delete;
+  Acc &operator=(const Acc &) = delete;
+  Acc(Acc &&) = default;
+  Acc &operator=(Acc &&) = default;
+
   // ------------------------------------------------------------------------
   // 描述/配置状态访问
   // ------------------------------------------------------------------------
@@ -287,7 +301,7 @@ struct Acc {
   YAI_ALWAYS_INLINE void fill(float value) {
     YAI_COMPILER_INTRINSIC(acc_fill)(value_, value);
   }
-  YAI_ALWAYS_INLINE void mask(std::int32_t diag,
+  YAI_ALWAYS_INLINE void mask_(std::int32_t diag,
                               float value = -3.402823466e+38F) {
     YAI_COMPILER_INTRINSIC(acc_mask)(value_, diag, value);
   }
@@ -300,55 +314,106 @@ struct Acc {
     YAI_COMPILER_INTRINSIC(acc_quant_ext)(value_, yai_handle(scale),
                                           yai_handle(tile));
   }
-  YAI_ALWAYS_INLINE void to_fp32() {
+  YAI_ALWAYS_INLINE void to_fp32_() {
     YAI_COMPILER_INTRINSIC(acc_to_fp32)(value_);
   }
 
-  YAI_ALWAYS_INLINE void add(const Acc &b) {
+  YAI_ALWAYS_INLINE void add_(const Acc &b) {
     YAI_COMPILER_INTRINSIC(acc_add_inplace)(value_, yai_handle(b));
   }
-  YAI_ALWAYS_INLINE void sub(const Acc &b) {
+  YAI_ALWAYS_INLINE void sub_(const Acc &b) {
     YAI_COMPILER_INTRINSIC(acc_sub_inplace)(value_, yai_handle(b));
   }
-  YAI_ALWAYS_INLINE void mul(const Acc &b) {
+  YAI_ALWAYS_INLINE void mul_(const Acc &b) {
     YAI_COMPILER_INTRINSIC(acc_mul_inplace)(value_, yai_handle(b));
   }
-  YAI_ALWAYS_INLINE void div(const Acc &b) {
-    YAI_COMPILER_INTRINSIC(acc_div_inplace)(value_, yai_handle(b));
-  }
-  YAI_ALWAYS_INLINE void add(float value) {
+  YAI_ALWAYS_INLINE void add_(float value) {
     YAI_COMPILER_INTRINSIC(acc_add_scalar)(value_, value);
   }
-  YAI_ALWAYS_INLINE void mul(float value) {
-    YAI_COMPILER_INTRINSIC(acc_mul_scalar)(value_, value);
+  // ── 返回值版本（不带尾下划线）───────────────────────────────────────
+  // 语义：返回一个新值，*this 不变。
+  // 当前实现 = 真拷贝 + 原地运算（生成 cfg.copy + acopy + 一条 op）；
+  // 后端把 acc 运算改成 untied 指令后，这里会退化成单条指令、不再搬 4 KB。
+  // [[nodiscard]] 是关键安全网：写成 `x.mul(k);` 丢掉返回值会被编译器告警。
+  [[nodiscard]] YAI_ALWAYS_INLINE Acc add(const Acc &b) const {
+    Acc t = copy();
+    t.add_(b);
+    return t;
   }
-  YAI_ALWAYS_INLINE void abs() {
-    YAI_COMPILER_INTRINSIC(acc_abs)(value_);
+  [[nodiscard]] YAI_ALWAYS_INLINE Acc sub(const Acc &b) const {
+    Acc t = copy();
+    t.sub_(b);
+    return t;
   }
-  YAI_ALWAYS_INLINE void exp() {
-    YAI_COMPILER_INTRINSIC(acc_exp)(value_);
+  [[nodiscard]] YAI_ALWAYS_INLINE Acc mul(const Acc &b) const {
+    Acc t = copy();
+    t.mul_(b);
+    return t;
   }
-  YAI_ALWAYS_INLINE void silu() {
-    YAI_COMPILER_INTRINSIC(acc_silu)(value_);
+  /// 值版本：直接写到一个新寄存器（post-RA 会先克隆 ac 描述符）。
+  /// 没有 4 KB 的数据搬移，只有 1 条 cfg.copy + 1 条运算。
+  [[nodiscard]] YAI_ALWAYS_INLINE Acc mul(float value) const {
+    return Acc(YAI_COMPILER_INTRINSIC(acc_mul_scalar_val)(value_, value));
   }
-  YAI_ALWAYS_INLINE void sin() {
-    YAI_COMPILER_INTRINSIC(acc_sin)(value_);
+  [[nodiscard]] YAI_ALWAYS_INLINE Acc exp() const {
+    Acc t = copy();
+    t.exp_();
+    return t;
   }
-  YAI_ALWAYS_INLINE void cos() {
-    YAI_COMPILER_INTRINSIC(acc_cos)(value_);
+  [[nodiscard]] YAI_ALWAYS_INLINE Acc mul(const Vec32 &v, bool col = true) const {
+    Acc t = copy();
+    t.mul_(v, col);
+    return t;
+  }
+  [[nodiscard]] YAI_ALWAYS_INLINE Acc sub(const Vec32 &v, bool col = true) const {
+    Acc t = copy();
+    t.sub_(v, col);
+    return t;
+  }
+  [[nodiscard]] YAI_ALWAYS_INLINE Acc add(float value) const {
+    return Acc(YAI_COMPILER_INTRINSIC(acc_add_scalar_val)(value_, value));
   }
 
-  YAI_ALWAYS_INLINE void add(const Vec32 &v, bool col = true) {
+  YAI_ALWAYS_INLINE void mul_(float value) {
+    YAI_COMPILER_INTRINSIC(acc_mul_scalar)(value_, value);
+  }
+  /// 返回一个新值（真 acopy）。
+  [[nodiscard]] YAI_ALWAYS_INLINE Acc copy() const {
+    return Acc(YAI_COMPILER_INTRINSIC(acc_copy)(value_));
+  }
+
+  /// 近似倒数 1/x（ISA 没有 div；rcp.approx 的相对误差 ≤ 2^-10）。
+  YAI_ALWAYS_INLINE void rcp_() {
+    YAI_COMPILER_INTRINSIC(acc_rcp)(value_);
+  }
+  /// 精确倒数：rcp.approx（误差 ≤ 2^-10）后用 Newton-Raphson 精炼。
+  /// r ← r·(2 − x·r)，误差平方收敛：1e-3 → 1e-6 → 1e-12（优于 fp32）。
+  /// 依赖"拷贝构造发 acopy"，所以 `Acc t = x` 是真正的拷贝，不会改坏 x。
+  YAI_ALWAYS_INLINE void rcp_refine_(const Acc &x, int steps = 2) {
+    rcp_();
+    for (int i = 0; i < steps; ++i) {
+      Acc t = x.copy();   // 显式拷贝
+      t.mul_(*this);   // t = x·r
+      t.mul_(-1.0f);
+      t.add_(2.0f);    // t = 2 − x·r
+      mul_(t);         // r = r·(2 − x·r)
+    }
+  }
+  YAI_ALWAYS_INLINE void exp_() {
+    YAI_COMPILER_INTRINSIC(acc_exp)(value_);
+  }
+  YAI_ALWAYS_INLINE void silu_() {
+    YAI_COMPILER_INTRINSIC(acc_silu)(value_);
+  }
+
+  YAI_ALWAYS_INLINE void add_(const Vec32 &v, bool col = true) {
     YAI_COMPILER_INTRINSIC(acc_add_vec)(value_, yai_handle(v), col);
   }
-  YAI_ALWAYS_INLINE void sub(const Vec32 &v, bool col = true) {
+  YAI_ALWAYS_INLINE void sub_(const Vec32 &v, bool col = true) {
     YAI_COMPILER_INTRINSIC(acc_sub_vec)(value_, yai_handle(v), col);
   }
-  YAI_ALWAYS_INLINE void mul(const Vec32 &v, bool col = true) {
+  YAI_ALWAYS_INLINE void mul_(const Vec32 &v, bool col = true) {
     YAI_COMPILER_INTRINSIC(acc_mul_vec)(value_, yai_handle(v), col);
-  }
-  YAI_ALWAYS_INLINE void div(const Vec32 &v, bool col = true) {
-    YAI_COMPILER_INTRINSIC(acc_div_vec)(value_, yai_handle(v), col);
   }
 
   YAI_ALWAYS_INLINE Vec32 row_max() const;
@@ -426,6 +491,13 @@ struct Vec32 {
       : value_(YAI_COMPILER_INTRINSIC(vec32_create)()) {}
   YAI_ALWAYS_INLINE explicit Vec32(Vec32Value value) : value_(value) {}
 
+  // 同 Acc：显式发 vcopy，避免"赋值被折叠成别名"。
+  // 同 Acc：禁止隐式拷贝，显式 copy() 才算真拷贝。
+  Vec32(const Vec32 &) = delete;
+  Vec32 &operator=(const Vec32 &) = delete;
+  Vec32(Vec32 &&) = default;
+  Vec32 &operator=(Vec32 &&) = default;
+
   YAI_ALWAYS_INLINE std::byte *get_data() const {
     return reinterpret_cast<std::byte *>(YAI_COMPILER_INTRINSIC(vec32_get_data)(value_));
   }
@@ -474,35 +546,79 @@ struct Vec32 {
   YAI_ALWAYS_INLINE void store() {
     YAI_COMPILER_INTRINSIC(vec32_store)(value_);
   }
-  YAI_ALWAYS_INLINE void add(const Vec32 &b) {
+  YAI_ALWAYS_INLINE void add_(const Vec32 &b) {
     YAI_COMPILER_INTRINSIC(vec32_add)(value_, yai_handle(b));
   }
-  YAI_ALWAYS_INLINE void sub(const Vec32 &b) {
+  YAI_ALWAYS_INLINE void sub_(const Vec32 &b) {
     YAI_COMPILER_INTRINSIC(vec32_sub)(value_, yai_handle(b));
   }
-  YAI_ALWAYS_INLINE void mul(const Vec32 &b) {
+  YAI_ALWAYS_INLINE void mul_(const Vec32 &b) {
     YAI_COMPILER_INTRINSIC(vec32_mul)(value_, yai_handle(b));
   }
-  YAI_ALWAYS_INLINE void div(const Vec32 &b) {
-    YAI_COMPILER_INTRINSIC(vec32_div)(value_, yai_handle(b));
-  }
-  YAI_ALWAYS_INLINE void add(float value) {
+  YAI_ALWAYS_INLINE void add_(float value) {
     YAI_COMPILER_INTRINSIC(vec32_add_scalar)(value_, value);
   }
-  YAI_ALWAYS_INLINE void mul(float value) {
+  // ── 返回值版本（不带尾下划线），语义同 Acc ──
+  [[nodiscard]] YAI_ALWAYS_INLINE Vec32 add(const Vec32 &b) const {
+    Vec32 t = copy();
+    t.add_(b);
+    return t;
+  }
+  [[nodiscard]] YAI_ALWAYS_INLINE Vec32 mul(const Vec32 &b) const {
+    Vec32 t = copy();
+    t.mul_(b);
+    return t;
+  }
+  [[nodiscard]] YAI_ALWAYS_INLINE Vec32 exp() const {
+    Vec32 t = copy();
+    t.exp_();
+    return t;
+  }
+  [[nodiscard]] YAI_ALWAYS_INLINE Vec32 sub(const Vec32 &b) const {
+    Vec32 t = copy();
+    t.sub_(b);
+    return t;
+  }
+  [[nodiscard]] YAI_ALWAYS_INLINE Vec32 mul(float value) const {
+    Vec32 t = copy();
+    t.mul_(value);
+    return t;
+  }
+
+  YAI_ALWAYS_INLINE void mul_(float value) {
     YAI_COMPILER_INTRINSIC(vec32_mul_scalar)(value_, value);
   }
-  YAI_ALWAYS_INLINE void rsqrt() {
+  YAI_ALWAYS_INLINE void rsqrt_() {
     YAI_COMPILER_INTRINSIC(vec32_rsqrt)(value_);
   }
-  YAI_ALWAYS_INLINE void exp() {
+  /// 近似倒数 1/x（ISA 没有 div；rcp.approx 的相对误差 ≤ 2^-10）。
+  YAI_ALWAYS_INLINE void rcp_() {
+    YAI_COMPILER_INTRINSIC(vec32_rcp)(value_);
+  }
+  /// 精确倒数：rcp.approx + Newton-Raphson 精炼（误差平方收敛）。
+  YAI_ALWAYS_INLINE void rcp_refine_(const Vec32 &x, int steps = 2) {
+    rcp_();
+    for (int i = 0; i < steps; ++i) {
+      Vec32 t = x.copy();
+      t.mul_(*this);
+      t.mul_(-1.0f);
+      t.add_(2.0f);
+      mul_(t);
+    }
+  }
+  YAI_ALWAYS_INLINE void exp_() {
     YAI_COMPILER_INTRINSIC(vec32_exp)(value_);
   }
-  YAI_ALWAYS_INLINE void max(const Vec32 &b) {
+  YAI_ALWAYS_INLINE void max_(const Vec32 &b) {
     YAI_COMPILER_INTRINSIC(vec32_max)(value_, yai_handle(b));
   }
   YAI_ALWAYS_INLINE void fill(float value) {
     YAI_COMPILER_INTRINSIC(vec32_fill)(value_, value);
+  }
+  /// 返回一个新值（真 vcopy）。注意与下面的 void copy(const Vec32&) 不同：
+  /// 那个是"把 b 拷进 *this"，这个是"把 *this 拷出来"。
+  [[nodiscard]] YAI_ALWAYS_INLINE Vec32 copy() const {
+    return Vec32(YAI_COMPILER_INTRINSIC(vec32_copy)(value_));
   }
   YAI_ALWAYS_INLINE void copy(const Vec32 &b) {
     value_ = YAI_COMPILER_INTRINSIC(vec32_copy)(yai_handle(b));

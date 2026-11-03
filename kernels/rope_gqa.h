@@ -66,19 +66,19 @@ YAI_OP_INLINE void rope_head_hd(const MatrixView &x, const MatrixView &cos_t,
 
       set_zone(l, nr, n);
       load_acc_at(l, p0);
-      l.mul(co);
+      l.mul_(co);
       set_zone(t, nr, n);
       load_acc_at(t, p1);
-      t.mul(si);
-      l.sub(t);
+      t.mul_(si);
+      l.sub_(t);
 
       set_zone(r, nr, n);
       load_acc_at(r, p0);
-      r.mul(si);
+      r.mul_(si);
       set_zone(t2, nr, n);
       load_acc_at(t2, p1);
-      t2.mul(co);
-      r.add(t2);
+      t2.mul_(co);
+      r.add_(t2);
 
       store_acc_at(l, p0);
       store_acc_at(r, p1);

@@ -46,6 +46,8 @@ YAI_OP_INLINE void embedding_rows(const MatrixView &table,
   a.set_dtype(AccDType::I32);                  // widen 需要 i32；to_fp32 会改成 f32
   Vec32 idv{};
   config_vec(idv, ids);
+  // 新 ISA 要求 gather 的索引向量 dtype 为 u32（非负），不是 i32。
+  idv.set_dtype(Vec32DType::U32);
   Vec32 esv{};
   esv.set_dtype(Vec32DType::F32);
   esv.set_stride(scale.row_bytes);
@@ -71,8 +73,8 @@ YAI_OP_INLINE void embedding_rows(const MatrixView &table,
       // → 这里必须每块重设 dtype（原代码每次新建 acc 所以不需要）。
       a.set_dtype(AccDType::I32);
       t.widen(a);                              // i8 → i32
-      a.to_fp32();
-      a.mul(esv, true);
+      a.to_fp32_();
+      a.mul_(esv, true);
       store_acc_at(a, out.data + m * static_cast<std::uint32_t>(out.row_bytes) +
                       k * static_cast<std::uint32_t>(out.col_bytes));
     }
@@ -110,6 +112,8 @@ YAI_OP_INLINE void embedding_rmsnorm_rows(const MatrixView &table,
   a.set_dtype(AccDType::I32);
   Vec32 idv{};
   config_vec(idv, ids);
+  // 新 ISA 要求 gather 的索引向量 dtype 为 u32（非负），不是 i32。
+  idv.set_dtype(Vec32DType::U32);
   Vec32 esv{};
   esv.set_dtype(Vec32DType::F32);
   esv.set_stride(scale.row_bytes);
@@ -122,6 +126,8 @@ YAI_OP_INLINE void embedding_rmsnorm_rows(const MatrixView &table,
 
   for (std::uint32_t m = 0; m < ids.rows; m += kBlock) {
     const std::uint8_t nr = block_zone(ids.rows, m);
+    set_len(ss, nr);
+    ss.fill(0.0f);
 
     // ---- id 与 per-token scale ----
     set_len(idv, nr);
@@ -139,19 +145,16 @@ YAI_OP_INLINE void embedding_rmsnorm_rows(const MatrixView &table,
       set_zone(a, nr, nc);
       a.set_dtype(AccDType::I32);
       t.widen(a);
-      a.to_fp32();
-      a.mul(esv, true);
+      a.to_fp32_();
+      a.mul_(esv, true);
       store_acc_at(a, tmp.data + m * static_cast<std::uint32_t>(tmp.row_bytes) +
                       k * static_cast<std::uint32_t>(tmp.col_bytes));
-      if (k == 0) {
-        ss = a.row_sum_sq();
-      } else {
-        a.row_sum_sq(ss);
-      }
+      // 统一用 merge 形式（ss += 行平方和），ss 已在循环外清零并配好 len。
+      a.row_sum_sq(ss);
     }
-    ss.mul(inv);
-    ss.add(kEps);
-    ss.rsqrt();
+    ss.mul_(inv);
+    ss.add_(kEps);
+    ss.rsqrt_();
 
     // ---- 第二遍：读 tmp → ×ss(byrow) → ×w(bycol) → 写 out ----
     for (std::uint32_t k = 0; k < tmp.cols; k += kBlock) {
@@ -161,8 +164,8 @@ YAI_OP_INLINE void embedding_rmsnorm_rows(const MatrixView &table,
                      k * static_cast<std::uint32_t>(tmp.col_bytes));
       set_len(wv, nc);
       load_vec_at(wv, w.data + k * static_cast<std::uint32_t>(w.row_bytes));
-      b.mul(ss, true);
-      b.mul(wv, false);
+      b.mul_(ss, true);
+      b.mul_(wv, false);
       store_acc_at(b, out.data + m * static_cast<std::uint32_t>(out.row_bytes) +
                       k * static_cast<std::uint32_t>(out.col_bytes));
     }

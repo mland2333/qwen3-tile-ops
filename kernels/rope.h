@@ -40,20 +40,20 @@ YAI_OP_INLINE void rope_head(const MatrixView &x, const MatrixView &cos_t,
   // ---- 2) 左半：a0*cos - a1*sin ----
   Acc left{};
   load_acc_h(left, x, 0, 0, kHalf);
-  left.mul(co);
+  left.mul_(co);
   Acc t{};
   load_acc_h(t, x, 0, kHalf, kHalf);
-  t.mul(si);
-  left.sub(t);
+  t.mul_(si);
+  left.sub_(t);
 
   // ---- 3) 右半：a0*sin + a1*cos（此时 x 还没被改写）----
   Acc right{};
   load_acc_h(right, x, 0, 0, kHalf);
-  right.mul(si);
+  right.mul_(si);
   Acc t2{};
   load_acc_h(t2, x, 0, kHalf, kHalf);
-  t2.mul(co);
-  right.add(t2);
+  t2.mul_(co);
+  right.add_(t2);
 
   // ---- 4) 两个输出都算完再写回，避免第二半覆盖第一半的输入 ----
   store_acc_h(left, x, 0, 0);

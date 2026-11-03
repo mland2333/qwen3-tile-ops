@@ -63,11 +63,12 @@ YAI_OP_INLINE void swiglu(const MatrixView &gate, const MatrixView &up,
       load_acc_at(e, gate.data + off_g);
       set_zone(u, nr, nc);
       load_acc_at(u, up.data + off_u);
-      e.mul(-1.0f);
-      e.exp();
-      e.add(1.0f);
-      g.div(e);
-      g.mul(u);
+      e.mul_(-1.0f);
+      e.exp_();
+      e.add_(1.0f);
+      e.rcp_();
+      g.mul_(e);
+      g.mul_(u);
       store_acc_at(g, out.data + m * static_cast<std::uint32_t>(out.row_bytes) +
                       n * static_cast<std::uint32_t>(out.col_bytes));
     }
@@ -91,7 +92,7 @@ YAI_OP_INLINE void add_rows(const MatrixView &dst, const MatrixView &src) {
       set_zone(b, nr, nc);
       load_acc_at(b, src.data + m * static_cast<std::uint32_t>(src.row_bytes) +
                       n * static_cast<std::uint32_t>(src.col_bytes));
-      a.add(b);
+      a.add_(b);
       store_acc_at(a, dst.data + off_d);
     }
   }
