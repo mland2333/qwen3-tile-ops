@@ -26,6 +26,7 @@ constexpr std::uintptr_t A_OFF = 0x0000;
 constexpr std::uintptr_t B_OFF = 0x1000;
 constexpr std::uintptr_t V_OFF = 0x2000;
 constexpr std::uintptr_t W_OFF = 0x2100;
+constexpr std::uintptr_t TILE_OFF = 0x2200;   // 32x32 i8 for the dequant case
 constexpr std::uintptr_t OUT_OFF = 0x4000;
 constexpr std::uintptr_t SLOT = 0x1000;
 
@@ -120,6 +121,7 @@ int main() {
   std::byte *B = blob + B_OFF;
   std::byte *V = blob + V_OFF;
   std::byte *W = blob + W_OFF;
+  std::byte *TILE_IN = blob + TILE_OFF;
   Slots slots{blob + OUT_OFF};
 
   // 0/1: Acc + Acc
@@ -181,6 +183,39 @@ int main() {
   CASE_VEC_UN("vexp", a.exp(), u.exp_());
   // 26/27: Vec32 * scalar
   CASE_VEC_UN("vmul_scalar", a.mul(0.25f), u.mul_(0.25f));
+  // 28/29: Vec32 max
+  CASE_VEC_BIN("vmax", a.max(b), u.max_(b));
+  // 30/31: Vec32 rcp
+  CASE_VEC_UN("vrcp", a.rcp(), u.rcp_());
+  // 32/33: Vec32 rsqrt
+  CASE_VEC_UN("vrsqrt", a.rsqrt(), u.rsqrt_());
+  // 34/35: Acc rcp
+  CASE_ACC_UN("arcp", a.rcp(), u.rcp_());
+  // 36/37: tdequant vs widen + acvt + mul(byrow)
+  {
+    Tile t{};
+    t.set_dtype(TileDType::I8);
+    t.set_valid_zone(ROWS, COLS);
+    t.set_strides(COLS, 1);
+    t.set_data(TILE_IN);
+    t.load();
+    Vec32 s{};
+    load_vec(s, V);
+    Acc d{};
+    d.set_dtype(AccDType::F32);
+    d.set_valid_zone(ROWS, COLS);
+    d.set_strides(COLS * 4, 4);
+    t.dequant(s, d);
+    store_acc(d, slots.take());
+    Acc r{};
+    r.set_dtype(AccDType::I32);
+    r.set_valid_zone(ROWS, COLS);
+    r.set_strides(COLS * 4, 4);
+    t.widen(r);
+    r.to_fp32_();
+    r.mul_(s, true);
+    store_acc(r, slots.take());
+  }
 
   return 0;
 }

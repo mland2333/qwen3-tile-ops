@@ -193,8 +193,11 @@ struct Tile {
     YAI_COMPILER_INTRINSIC(tile_matmul)(value_, yai_handle(right),
                                         yai_handle(acc), zero, lt, rt);
   }
-  YAI_ALWAYS_INLINE Acc dequant(const Vec32 &scale,
-                                bool col = true) const;
+  // tdequant.rows.f32：out[i,j] = f32(tile[i,j]) * scale[i]。
+  // 与 widen 一样是"写进已有寄存器的目的"，out 必须由调用方先配好
+  // dtype=f32、valid_zone = tile 的有效形状；scale 的 vc.len = tile 行数。
+  // ISA 只提供按行（per-row）反量化，没有按列的形态。
+  YAI_ALWAYS_INLINE void dequant(const Vec32 &scale, Acc &out) const;
   // Tile i8 -> Acc i32 符号扩展（embedding 的 widen）；out 需先配好
   // dtype=i32、valid_zone = tile 形状。
   YAI_ALWAYS_INLINE void widen(Acc &out) const;
@@ -372,6 +375,10 @@ struct Acc {
   /// 近似倒数 1/x（ISA 没有 div；rcp.approx 的相对误差 ≤ 2^-10）。
   YAI_ALWAYS_INLINE void rcp_() {
     YAI_COMPILER_INTRINSIC(acc_rcp)(value_);
+  }
+  /// 值版本：新寄存器 = 1/x（post-RA 只补 cfg.copy）。
+  [[nodiscard]] YAI_ALWAYS_INLINE Acc rcp() const {
+    return Acc(YAI_COMPILER_INTRINSIC(acc_rcp_val)(value_));
   }
   /// 精确倒数：rcp.approx（误差 ≤ 2^-10）后用 Newton-Raphson 精炼。
   /// r ← r·(2 − x·r)，误差平方收敛：1e-3 → 1e-6 → 1e-12（优于 fp32）。
@@ -562,6 +569,17 @@ struct Vec32 {
   [[nodiscard]] YAI_ALWAYS_INLINE Vec32 mul(float value) const {
     return Vec32(YAI_COMPILER_INTRINSIC(vec32_mul_scalar_val)(value_, value));
   }
+  [[nodiscard]] YAI_ALWAYS_INLINE Vec32 max(const Vec32 &b) const {
+    return Vec32(YAI_COMPILER_INTRINSIC(vec32_max_val)(value_, yai_handle(b)));
+  }
+  /// 值版本：新寄存器 = 1/x。
+  [[nodiscard]] YAI_ALWAYS_INLINE Vec32 rcp() const {
+    return Vec32(YAI_COMPILER_INTRINSIC(vec32_rcp_val)(value_));
+  }
+  /// 值版本：新寄存器 = 1/sqrt(x)。
+  [[nodiscard]] YAI_ALWAYS_INLINE Vec32 rsqrt() const {
+    return Vec32(YAI_COMPILER_INTRINSIC(vec32_rsqrt_val)(value_));
+  }
 
   YAI_ALWAYS_INLINE void mul_(float value) {
     YAI_COMPILER_INTRINSIC(vec32_mul_scalar)(value_, value);
@@ -617,8 +635,8 @@ YAI_ALWAYS_INLINE Vec32Value yai_handle(const Vec32 &value) {
 }
 
 // 返回新逻辑值的操作：返回值本身将来由 intrinsic 降为新的 Acc/Vec32 SSA 值。
-YAI_ALWAYS_INLINE Acc Tile::dequant(const Vec32 &scale, bool col) const {
-  return Acc(YAI_COMPILER_INTRINSIC(tile_dequant)(value_, yai_handle(scale), col));
+YAI_ALWAYS_INLINE void Tile::dequant(const Vec32 &scale, Acc &out) const {
+  YAI_COMPILER_INTRINSIC(tile_dequant)(value_, yai_handle(scale), yai_handle(out));
 }
 YAI_ALWAYS_INLINE void Tile::widen(Acc &out) const {
   YAI_COMPILER_INTRINSIC(tile_widen)(value_, yai_handle(out));

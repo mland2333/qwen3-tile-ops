@@ -27,7 +27,9 @@ CASES = [
     "acc mul byrow", "acc mul bycol", "acc sub byrow",
     "acc mul scalar", "acc add scalar",
     "vec add", "vec sub", "vec mul", "vec exp", "vec mul scalar",
+    "vec max", "vec rcp", "vec rsqrt", "acc rcp", "tile dequant",
 ]
+APPROX = {"acc exp", "vec exp", "vec rsqrt"}
 
 
 def inputs() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -36,6 +38,11 @@ def inputs() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     v = np.linspace(-1.0, 1.0, LANES, dtype=np.float32) + np.float32(0.25)
     w = (np.arange(LANES, dtype=np.float32) * np.float32(0.25)) - np.float32(1.0)
     return a, b, v, w
+
+
+def tile_i8() -> np.ndarray:
+    vals = ((np.arange(ROWS * COLS) * 37) % 251) - 125   # spread over int8
+    return vals.astype(np.int8).reshape(ROWS, COLS)
 
 
 def expected(a, b, v, w) -> list[np.ndarray]:
@@ -55,6 +62,11 @@ def expected(a, b, v, w) -> list[np.ndarray]:
         (v * w).astype(np.float32),
         np.exp2((v * LOG2E).astype(np.float32)).astype(np.float32),
         (v * np.float32(0.25)).astype(np.float32),
+        np.maximum(v, w).astype(np.float32),
+        (np.float32(1.0) / v).astype(np.float32),
+        (np.float32(1.0) / np.sqrt(v.astype(np.float32))).astype(np.float32),
+        (np.float32(1.0) / a).astype(np.float32),
+        (tile_i8().astype(np.float32) * v[:, None]).astype(np.float32),
     ]
     return out
 
@@ -65,6 +77,7 @@ def main() -> int:
     ap.add_argument("--bridge", default=str(ROOT / "build" / "sim_bridge"))
     ap.add_argument("--blob", default=str(ROOT / "build" / "value_ops_data.bin"))
     ap.add_argument("--out", default=str(ROOT / "build" / "value_ops_out.bin"))
+    ap.add_argument("--tile-off", type=lambda x: int(x, 0), default=0x2200)
     args = ap.parse_args()
 
     a, b, v, w = inputs()
@@ -74,6 +87,8 @@ def main() -> int:
     blob[0x1000:0x1000 + ACC_BYTES] = b.tobytes()
     blob[0x2000:0x2000 + LANES * 4] = v.tobytes()
     blob[0x2100:0x2100 + LANES * 4] = w.tobytes()
+    tile = tile_i8()
+    blob[args.tile_off:args.tile_off + tile.nbytes] = tile.tobytes()
     Path(args.blob).write_bytes(bytes(blob))
 
     result = subprocess.run([args.bridge, args.guest, args.blob, args.out],
@@ -96,9 +111,9 @@ def main() -> int:
         got_copy = data[copy_at:copy_at + nbytes].view(np.float32).reshape(shape)
         same = np.array_equal(got_value.view(np.uint32), got_copy.view(np.uint32))
         want = exp[idx]
-        if name.endswith("exp"):
-            note = f" numpy max|d|={np.abs(got_value - want).max():.3g}"
-            numpy_ok = bool(np.allclose(got_value, want, rtol=1e-6, atol=1e-6))
+        if name in APPROX:
+            note = f" numpy max|d|={np.nanmax(np.abs(got_value.astype(np.float64) - want.astype(np.float64))):.3g}"
+            numpy_ok = bool(np.allclose(got_value, want, rtol=1e-6, atol=1e-6, equal_nan=True))
         else:
             numpy_ok = np.array_equal(got_value.view(np.uint32), want.view(np.uint32))
             note = " numpy exact" if numpy_ok else " NUMPY-MISMATCH"

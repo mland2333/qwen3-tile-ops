@@ -158,10 +158,15 @@ dtype），**不发 `acopy`/`vcopy`**：
 | `Vec32 t = u.add(v)` / `sub` / `mul` | `cfg.copy` + `vadd`/`vsub`/`vmul` | 无 |
 | `Vec32 t = u.exp()` | `cfg.copy` + `vmulx` + `vexp2` | 无 |
 | `Vec32 t = u.mul(k)` | `cfg.copy` + `vmulx` | 无 |
+| `Acc t = x.rcp()` | `cfg.copy` + `arcp.approx` | 无 |
+| `Vec32 t = u.rcp()` / `rsqrt()` | `cfg.copy` + `vrcp.approx`/`vrsqrt.approx` | 无 |
+| `Vec32 t = u.max(v)` | `cfg.copy` + `vmax` | 无 |
+| `t.dequant(scale, out)` | `tdequant.rows.f32 out, t, scale` | 无（写已有 Acc） |
 | `Acc/Vec32 t = x.copy()` | `cfg.copy` + `acopy`/`vcopy` | 是（语义就是要副本） |
 
-`make value-ops` 是这套语义的回归：14 个 case 各自算“值形式”和“copy+原地”，
-逐位相同且与 numpy 一致（不需要模型，1 秒跑完）。attention 里原来的
+`make value-ops` 是这套语义的回归：19 个 case 各自算“值形式”和参考路径，
+逐位相同且与 numpy 一致（不需要模型，1 秒跑完）。其中 `tile dequant` 的参考
+路径是 `widen + to_fp32 + mul(byrow)`，`rsqrt` 用 `allclose(equal_nan=True)`。attention 里原来的
 `corr.copy(maximum); corr.sub_(nmm)` 已改成 `Vec32 corr = maximum.sub(nmm)`，
 prefill 32 的指令数因此 2,370,235 → **2,369,787**（每 KV 块省 1 条 `vcopy`）。
 
