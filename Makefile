@@ -72,6 +72,10 @@ $(GUEST): $(OBJECT) $(BUILD)/crt0.o
 
 big: $(GUEST)
 
+# ---- IDE: compile_commands.json（clangd / VS Code 的跳转依赖它）----
+compile_commands: tools/gen_compile_commands.py
+	$(PY) tools/gen_compile_commands.py --variant $(VARIANT)
+
 # ---- simulator bridge ------------------------------------------------------
 $(SIM_LIB):
 	@echo "missing $(SIM_LIB): build Tile-NPU-Sim first (xmake in $(TILE_NPU_SIM))" >&2

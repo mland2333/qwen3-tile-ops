@@ -1,0 +1,9 @@
+# VS Code / clangd：让算子代码的跳转可用。
+# compile_commands.json 由 `make compile_commands`（tools/gen_compile_commands.py）
+# 生成；里面给 guest TU 用的是标准 -march=rv64im（真实构建是 rv64im_xaicore）。
+CompileFlags:
+  CompilationDatabase: .
+Index:
+  Background: Build
+InlayHints:
+  Enabled: true
