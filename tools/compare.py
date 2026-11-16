@@ -39,6 +39,17 @@ DTYPES = {
     "u32": np.uint32,
 }
 
+# Fused production path: the last layer only computes the Q/attention/O/MLP
+# tail for the row whose logits are needed (the last row of the final chunk).
+# For these stages only that row is meaningful; compare it and skip the rest.
+FUSED_LAST_ROW = {
+    "h", "h8", "hs", "q", "attn", "o8", "os",
+    "g", "u", "sw", "s8", "ss", "x",
+}
+# q8/qs/o are also used as the final-norm scratch row 0; when the final chunk
+# has rows==1 that is the same as the last row, so skip instead of comparing.
+FUSED_LAST_ROW_SCRATCH = {"q8", "qs", "o"}
+
 
 def stage_regions(lay: dict[str, int], consts: dict[str, int]) -> list[tuple[str, str, int, tuple[int, ...]]]:
     """(ref key, dtype, offset, shape) for every recorded stage."""
@@ -59,16 +70,16 @@ def stage_regions(lay: dict[str, int], consts: dict[str, int]) -> list[tuple[str
         ("k", "f32", lay["kK"], (rows, kw)),
         ("v", "f32", lay["kV"], (rows, kw)),
         ("q8", "i8", lay["kQ8"], (rows, qw)),
-        ("qs", "f32", lay["kQS"], (rows,)),
+        ("qs", "f32", lay["kQS"], (None, heads)),
         ("attn", "f32", lay["kATTN"], (rows, qw)),
         ("o", "f32", lay["kO"], (rows, hidden)),
         ("o8", "i8", lay["kO8"], (rows, qw)),
-        ("os", "f32", lay["kOS"], (rows,)),
+        ("os", "f32", lay["kOS"], (None, heads)),
         ("g", "f32", lay["kG"], (rows, inter)),
         ("u", "f32", lay["kU"], (rows, inter)),
         ("sw", "f32", lay["kSW"], (rows, inter)),
         ("s8", "i8", lay["kS8"], (rows, inter)),
-        ("ss", "f32", lay["kSS"], (rows,)),
+        ("ss", "f32", lay["kSS"], (None, inter // 256)),
         ("x", "f32", lay["kX"], (rows, hidden)),
         ("logits", "f32", lay["kLOGITS"], (1, vocab)),
     ]
@@ -76,9 +87,9 @@ def stage_regions(lay: dict[str, int], consts: dict[str, int]) -> list[tuple[str
     kv_base = lay["kKV_BASE"] + (consts["kLayers"] - 1) * lay["kKV_STRIDE"]
     regions += [
         ("kc", "i8", kv_base, (None, kw)),
-        ("ks", "f32", kv_base + lay["kKV_SOFF"], (None,)),
+        ("ks", "f32", kv_base + lay["kKV_SOFF"], (None, kv_heads)),
         ("vc", "i8", kv_base + lay["kKV_VOFF"], (None, kw)),
-        ("vs", "f32", kv_base + lay["kKV_VOFF"] + lay["kKV_SOFF"], (None,)),
+        ("vs", "f32", kv_base + lay["kKV_VOFF"] + lay["kKV_SOFF"], (None, kv_heads)),
     ]
     return regions
 
@@ -113,6 +124,13 @@ def main() -> int:
     ap.add_argument("--ref", default="build/ref.npz")
     ap.add_argument("--layers", type=int, default=0)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument(
+        "--fused",
+        action="store_true",
+        help="production path fuses lm_head+argmax: skip the logits stage, "
+             "compare the last layer tail only on its last row, and check "
+             "argf/argi against ref_logits max/argmax",
+    )
     args = ap.parse_args()
 
     consts, lay = read_layout(Path(args.header))
@@ -123,6 +141,27 @@ def main() -> int:
 
     failures = 0
     for name, dtype, offset, shape in stage_regions(lay, consts):
+        if args.fused and name == "logits":
+            print("skip logits (fused lm_head+argmax production path)")
+            continue
+        if name == "o":
+            print("skip o (residual is fused into x)")
+            continue
+        if name == "attn":
+            print("skip attn (quantised in the attention epilogue)")
+            continue
+        if name in ("q", "k"):
+            print(f"skip {name} (norm/rope fused into the quant epilogue)")
+            continue
+        if name == "sw":
+            print("skip sw (SwiGLU quantised in the epilogue)")
+            continue
+        if name == "v":
+            print("skip v (V GEMM quantised in the epilogue)")
+            continue
+        if name in ("g", "u"):
+            print(f"skip {name} (gate/up GEMM quantised in the epilogue)")
+            continue
         key = "ref_" + name
         if key not in ref:
             continue
@@ -133,20 +172,59 @@ def main() -> int:
         elem = np.dtype(DTYPES[dtype]).itemsize
         raw = data[offset:offset + count * elem]
         got = raw.view(DTYPES[dtype]).reshape(shape)
-        aliased = {"q8": 1, "qs": 1, "o": 1}
-        if name in aliased:
-            # main_big reuses the first row of these buffers for the final-norm
-            # output (h8l/hsl/hl), so row 0 is not the kernel's result.
-            if shape[0] <= aliased[name]:
-                print(f"skip {name:7s} (aliased with the final-norm buffer)")
-                continue
-            got = got[aliased[name]:]
-            expected = expected[aliased[name]:]
+        note = ""
+        if args.fused:
+            if name in FUSED_LAST_ROW:
+                got = got[-1:]
+                expected = expected[-1:]
+                note = " [last row]"
+            elif name in FUSED_LAST_ROW_SCRATCH:
+                if expected.shape[0] == 1:
+                    print(f"skip {name:7s} (final-norm scratch row)")
+                    continue
+                got = got[-1:]
+                expected = expected[-1:]
+                note = " [last row]"
+        else:
+            aliased = {"q8": 1, "qs": 1, "o": 1}
+            if name in aliased:
+                # main_big reuses the first row of these buffers for the final-norm
+                # output (h8l/hsl/hl), so row 0 is not the kernel's result.
+                if shape[0] <= aliased[name]:
+                    print(f"skip {name:7s} (aliased with the final-norm buffer)")
+                    continue
+                got = got[aliased[name]:]
+                expected = expected[aliased[name]:]
         status = describe(got, expected)
         ok = "bit-exact True" in status or "int mismatches 0/" in status
         if not ok:
             failures += 1
-        print(f"{'ok  ' if ok else 'FAIL'} {name:7s} {str(shape):18s} {status}")
+        print(f"{'ok  ' if ok else 'FAIL'} {name:7s} {str(shape):18s} {status}{note}")
+    if args.fused and "ref_logits" in ref:
+        # 生产路径不再写 logits；argf/argi 就是 ref_logits 这一行的 max 和 argmax。
+        ref_logits = np.asarray(ref["ref_logits"]).reshape(-1)
+        expected_best = np.float32(ref_logits.max())
+        expected_idx = int(np.argmax(ref_logits))
+        best_off = lay["kARGF"]
+        idx_off = lay["kARGI"]
+        raw_best = data[best_off:best_off + 4]
+        raw_idx = data[idx_off:idx_off + 4]
+        got_best = raw_best.view(np.float32)[0]
+        got_best_bits = int(raw_best.view(np.uint32)[0])
+        got_idx = int(raw_idx.view(np.uint32)[0])
+        expected_best_bits = int(
+            np.array([expected_best], dtype=np.float32).view(np.uint32)[0])
+        best_ok = got_best_bits == expected_best_bits
+        idx_ok = got_idx == expected_idx
+        if not (best_ok and idx_ok):
+            failures += 1
+        print(
+            f"{'ok  ' if best_ok and idx_ok else 'FAIL'} fused   "
+            f"best={got_best:.6g} (0x{got_best_bits:08x}) bidx={got_idx} "
+            f"ref_best={expected_best:.6g} (0x{expected_best_bits:08x}) "
+            f"ref_bidx={expected_idx}"
+        )
+
     if "ids" in ref and "generated" in ref:
         max_seq = consts["kMaxSeq"]
         ids = data[lay["kIDS"]:lay["kIDS"] + 4 * max_seq].view(np.int32)

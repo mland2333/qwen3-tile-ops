@@ -6,7 +6,8 @@
 
 The tool copies the blob, patches the ChatML prompt ids, runs ``sim_bridge``
 and decodes the generated ids.  Greedy decoding happens on the device
-(``argmax_logits``); the host only tokenises and decodes.
+(``gemm_nt_argmax``: lm_head fused with argmax); the host only tokenises and
+decodes.
 """
 
 from __future__ import annotations
@@ -59,7 +60,6 @@ def main() -> int:
 
     consts, lay = read_layout(Path(args.header))
     max_seq = consts["kMaxSeq"]
-    vocab = consts["kVocab"]
     tokenizer = Tokenizer(args.tokenizer)
 
     if args.ids:
@@ -80,10 +80,12 @@ def main() -> int:
                     "--n-gen", str(args.max_new)], check=True)
 
     ids_dump = ROOT / "build" / "chat_ids.bin"
-    logits_dump = ROOT / "build" / "chat_logits.bin"
+    argf_dump = ROOT / "build" / "chat_argf.bin"
+    argi_dump = ROOT / "build" / "chat_argi.bin"
     cmd = [args.bridge, args.guest, str(work), str(Path("/dev/null")),
            "--dump", f"{ids_dump}@{lay['kIDS']}:{4 * max_seq}",
-           "--dump", f"{logits_dump}@{lay['kLOGITS']}:{4 * vocab}"]
+           "--dump", f"{argf_dump}@{lay['kARGF']}:4",
+           "--dump", f"{argi_dump}@{lay['kARGI']}:4"]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(result.stderr, file=sys.stderr)
@@ -100,10 +102,10 @@ def main() -> int:
 
     print(f"prompt: {len(prompt_ids)} tokens")
     print(f"new ids: {generated}")
-    if logits_dump.exists() and 4 * vocab <= logits_dump.stat().st_size:
-        logits = np.frombuffer(logits_dump.read_bytes()[:4 * vocab], dtype=np.float32)
-        top = int(np.argmax(logits))
-        print(f"device top-1: {top} (logit {float(logits[top]):.4f})")
+    if argf_dump.exists() and argi_dump.exists():
+        best = float(np.frombuffer(argf_dump.read_bytes()[:4], dtype=np.float32)[0])
+        top = int(np.frombuffer(argi_dump.read_bytes()[:4], dtype=np.uint32)[0])
+        print(f"device top-1: {top} (logit {best:.4f})")
     text = tokenizer.decode(stopped)
     print("--- output ---")
     print(text)

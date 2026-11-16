@@ -34,8 +34,8 @@ inline constexpr std::uint32_t kGemmNGroup = 8;
 YAI_ALWAYS_INLINE void gemm_one_n_block(const MatrixView &a, const MatrixView &b,
                                         const MatrixView &b_scale,
                                         const Vec32 &as, const MatrixView &out,
-                                        Tile &ta, Tile &tb, std::uint32_t m,
-                                        std::uint32_t n) {
+                                        Tile &ta, Tile &tb,
+                                        std::uint32_t m, std::uint32_t n) {
   const std::uint8_t rows = block_zone(a.rows, m);
   const std::uint8_t cols = block_zone(b.rows, n);
   Acc o{};
@@ -52,25 +52,27 @@ YAI_ALWAYS_INLINE void gemm_one_n_block(const MatrixView &a, const MatrixView &b
                          k * static_cast<std::uint32_t>(b.col_bytes));
     ta.matmul(tb, o, /*zero=*/false, /*lt=*/false, /*rt=*/true);
   }
-  o.to_fp32_();
-  o.mul_(as, true);
+  // 新 ISA 删除了 acvt：adequant 一条指令做 f32(o) * ws[j] * as[i]，
+  // 取代旧的 acvt + amulv.byrow(as) + amulv.bycol(ws)。
   Vec32 ws{};
-  load_vec_n(ws, b_scale, n, block_zone(b.rows, n));
-  o.mul_(ws, false);
-  store_acc(o, out, m, n);
+  load_vec_n(ws, b_scale, n, cols);
+  Acc of{};
+  init_f32_acc(of, rows, cols);
+  of.set_strides(out.row_bytes, out.col_bytes);
+  adequant(of, o, ws, as);
+  store_acc(of, out, m, n);
 }
 
 // 快路径的输出块 epilogue。
 YAI_ALWAYS_INLINE void gemm_epilogue_block(const Vec32 &as, Vec32 &ws,
-                                           Acc &o, const MatrixView &b_scale,
+                                           Acc &o, Acc &of,
                                            const MatrixView &out,
                                            std::uint32_t m, std::uint32_t n) {
-  o.to_fp32_();
-  o.mul_(as, true);
+  // of 由调用方在组外配好（f32 + zone + 输出 stride），这里只发 adequant：
+  // 一条指令做完 f32(o) * ws[j] * as[i]（acvt + 两次 amulv 已合并）。
   ws.load();                            // 描述符自增（len*stride）指向下一个 n 块
-  o.mul_(ws, false);
-  // acc 的 strides 已按 out 配好（与位置无关），这里只写 base_addr
-  store_acc_at(o, out.data + m * static_cast<std::uint32_t>(out.row_bytes) +
+  adequant(of, o, ws, as);
+  store_acc_at(of, out.data + m * static_cast<std::uint32_t>(out.row_bytes) +
                       n * static_cast<std::uint32_t>(out.col_bytes));
 }
 
@@ -162,14 +164,11 @@ YAI_OP_INLINE void gemm_nt(const MatrixView &a, const MatrixView &b,
         init_i32_acc(o6, rows, ZB);
         Acc o7{};
         init_i32_acc(o7, rows, ZB);
-        o0.set_strides(out.row_bytes, out.col_bytes);   // store 用，与位置无关
-        o1.set_strides(out.row_bytes, out.col_bytes);   // store 用，与位置无关
-        o2.set_strides(out.row_bytes, out.col_bytes);   // store 用，与位置无关
-        o3.set_strides(out.row_bytes, out.col_bytes);   // store 用，与位置无关
-        o4.set_strides(out.row_bytes, out.col_bytes);   // store 用，与位置无关
-        o5.set_strides(out.row_bytes, out.col_bytes);   // store 用，与位置无关
-        o6.set_strides(out.row_bytes, out.col_bytes);   // store 用，与位置无关
-        o7.set_strides(out.row_bytes, out.col_bytes);   // store 用，与位置无关
+        // o0..o7 只被 mma / adequant 读写（store 走 of），不需要 am 描述符。
+        // 8 个 epilogue 共用一个 f32 目的 acc：组内 zone/stride 不变，配一次就够
+        Acc of{};
+        init_f32_acc(of, rows, ZB);
+        of.set_strides(out.row_bytes, out.col_bytes);
         const std::uint32_t bn = n * bb;
         ta.set_data(a.data + am);            // 本组起点写一次
         ta.load();
@@ -217,14 +216,14 @@ YAI_OP_INLINE void gemm_nt(const MatrixView &a, const MatrixView &b,
           ta.matmul(t6, o6, /*zero=*/false, false, true);
           ta.matmul(t7, o7, /*zero=*/false, false, true);
         }
-        gemm_epilogue_block(as, ws, o0, b_scale, out, m, n);
-        gemm_epilogue_block(as, ws, o1, b_scale, out, m, n + 1 * kBlock);
-        gemm_epilogue_block(as, ws, o2, b_scale, out, m, n + 2 * kBlock);
-        gemm_epilogue_block(as, ws, o3, b_scale, out, m, n + 3 * kBlock);
-        gemm_epilogue_block(as, ws, o4, b_scale, out, m, n + 4 * kBlock);
-        gemm_epilogue_block(as, ws, o5, b_scale, out, m, n + 5 * kBlock);
-        gemm_epilogue_block(as, ws, o6, b_scale, out, m, n + 6 * kBlock);
-        gemm_epilogue_block(as, ws, o7, b_scale, out, m, n + 7 * kBlock);
+        gemm_epilogue_block(as, ws, o0, of, out, m, n);
+        gemm_epilogue_block(as, ws, o1, of, out, m, n + 1 * kBlock);
+        gemm_epilogue_block(as, ws, o2, of, out, m, n + 2 * kBlock);
+        gemm_epilogue_block(as, ws, o3, of, out, m, n + 3 * kBlock);
+        gemm_epilogue_block(as, ws, o4, of, out, m, n + 4 * kBlock);
+        gemm_epilogue_block(as, ws, o5, of, out, m, n + 5 * kBlock);
+        gemm_epilogue_block(as, ws, o6, of, out, m, n + 6 * kBlock);
+        gemm_epilogue_block(as, ws, o7, of, out, m, n + 7 * kBlock);
       }
     }
 

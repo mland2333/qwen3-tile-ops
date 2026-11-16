@@ -68,6 +68,57 @@ YAI_ALWAYS_INLINE std::uint8_t block_zone(std::uint32_t total,
                                        : left);
 }
 
+// ----------------------------------------------------------------------------
+// 稠密视图工厂：blob 的行主序布局
+//
+// pqwf 的每一张表都是稠密行主序：row_bytes = cols × sizeof(元素)，
+// col_bytes = sizeof(元素)。手工写 `MatrixView{p, cols*4, 4, rows, cols, kDtF32}`
+// 既啰嗦又容易把跨步和 dtype 写混，所以这里按 dtype 反推元素宽度：
+//
+//   f32_view(p, rows, cols)  ==  MatrixView{p, cols*4, 4, rows, cols, kDtF32}
+//   i8_view (p, rows, cols)  ==  MatrixView{p, cols,   1, rows, cols, kDtI8}
+//   i32_view(p, rows, cols)  ==  MatrixView{p, cols*4, 4, rows, cols, kDtI32}
+//
+// 注意：只适用于稠密布局。转置视图（attention 里的 Vᵀ：row_bytes=1）必须
+// 继续手写 MatrixView，不要用这个函数。
+// ----------------------------------------------------------------------------
+constexpr std::int32_t dtype_bytes(std::uint8_t dt) {
+  return (dt == kDtI8 || dt == kDtU8) ? 1 : 4;
+}
+
+YAI_ALWAYS_INLINE MatrixView dense_view(std::byte *data, std::uint32_t rows,
+                                        std::uint32_t cols, std::uint8_t dtype) {
+  const std::int32_t es = dtype_bytes(dtype);
+  return MatrixView{data, static_cast<std::int32_t>(cols) * es, es, rows, cols,
+                    dtype};
+}
+YAI_ALWAYS_INLINE MatrixView f32_view(std::byte *data, std::uint32_t rows,
+                                      std::uint32_t cols) {
+  return dense_view(data, rows, cols, kDtF32);
+}
+YAI_ALWAYS_INLINE MatrixView i8_view(std::byte *data, std::uint32_t rows,
+                                     std::uint32_t cols) {
+  return dense_view(data, rows, cols, kDtI8);
+}
+YAI_ALWAYS_INLINE MatrixView i32_view(std::byte *data, std::uint32_t rows,
+                                      std::uint32_t cols) {
+  return dense_view(data, rows, cols, kDtI32);
+}
+
+// ----------------------------------------------------------------------------
+// 行/列切片（列数/行数保持不变），覆盖编排层 90% 的 sub_view 用法：
+//   rows_of(w.x, pos, rows)   —— 取 [pos, pos+rows) 行（块/尾块/KV 追加）
+//   cols_of(qt, h*hd, hd)     —— 取 [c0, c0+hd) 列（切 head）
+// ----------------------------------------------------------------------------
+YAI_ALWAYS_INLINE MatrixView rows_of(const MatrixView &v, std::uint32_t r0,
+                                     std::uint32_t n) {
+  return sub_view(v, r0, 0, n, v.cols);
+}
+YAI_ALWAYS_INLINE MatrixView cols_of(const MatrixView &v, std::uint32_t c0,
+                                     std::uint32_t n) {
+  return sub_view(v, 0, c0, v.rows, n);
+}
+
 } // namespace qwen3_ops
 
 #endif

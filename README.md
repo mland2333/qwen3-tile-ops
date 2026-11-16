@@ -87,9 +87,10 @@ done
 ```bash
 make data      # 全量：build/full/{model_big.h, qwen3_big_data.bin, ref.npz}
 make big       # 编译 + 链接 build/qwen3_full.bin
-make check     # 跑到模拟器上，逐 stage 与 numpy 参考对比
+make check     # 逐 stage 对拍：mode 0 融合 + mode 1 非融合各跑一遍
 make small     # 1 层 / 1024 词表的冒烟测试（~30 MB blob，10 秒）
 make value-ops # Acc/Vec32 值形式 vs 显式拷贝的逐位对比（不需要模型）
+make group-gemm # per-128-group GEMM 原语测试（不需要模型）
 make chat TEXT="你好，请用一句话介绍你自己。" MAX_NEW=8
 ```
 
@@ -97,6 +98,19 @@ make chat TEXT="你好，请用一句话介绍你自己。" MAX_NEW=8
 （只保留前 N 层）、`--vocab V`（截断词表）、`--n-prompt/--n-gen/--ids`。
 
 ## 结果（本机实测）
+
+> **当前状态（全 per-group 在线量化）**：Q/K/V 仍按 head=128 量化；h8、
+> attention 输出/o8、SwiGLU/s8、final norm/lm_head 已改成 256 列一组，
+> GEMM 全部走 per-group K 累加。`make check` 两种模式都是 **0 stage(s)
+> differ**，fused best=**12.6227** @400；`make chat` 6 token 为
+> `151667 198 99692 3837 20002 104029`，与 `fp32_ref.py` 的 greedy 6 token
+> 完全一致。下面的表格是 per-token 版本的历史记录。32 token prefill 指令数
+> 在 256 组下约 **6.17M**（128 组时 6.98M，per-token 2.4M）；O/down 的
+> residual 已融进 per-group GEMM epilogue，attention 输出也在
+> `attention_head_hd128_blocks` 尾部直接按 head 量化，省掉 f32 attn 的
+> write+read；Q/K 的 norm/rope/per-head quant 也融成一个 kernel，q/k f32
+> 只读一次、norm/rope 不再写回。32 token prefill 约 **6.05M**。下一步是
+> V 的 GEMM 输出融合和 gate/up 的 SwiGLU/quant epilogue。
 
 设备输出与 `tools/ref_qwen3.py`（逐指令对齐 tile 语义的 numpy 镜像）对比：
 
@@ -107,6 +121,13 @@ make chat TEXT="你好，请用一句话介绍你自己。" MAX_NEW=8
 | **28 层 / 151936 词表，32 token prefill** | 全部 stage 逐位相同，logits（151936 个）max\|Δ\|=0 |
 | **28 层，15 token prompt + 贪心生成 6** | 全部 stage 逐位相同；生成 id `151667 198 99692 3837 3837 35946` 与参考一致 |
 
+> 现在生产路径（mode 0）的 lm_head 与 argmax 已融合，不再写 logits；
+> mode 1 是非融合参考路径，仍然写完整 logits。`make check` 会对两种模式各跑
+> 一遍：mode 0 比较 `argf`/`argi` 与 `ref_logits` 的 max/argmax，mode 1 比较
+> 完整 logits 和生成 id。最后一层的 Q/attention/O/MLP 在 mode 0 里只算需要
+> logits 的行，所以 `--fused` 对这些 stage 只比较 `[last row]`；K/V 和
+> KV cache 仍然比较所有行。
+
 与“真正的模型”对比（`tools/fp32_ref.py`，无 int8、无分块、无 online softmax）：
 
 * 同一 prompt 的 top-1 完全相同（`151667` = `<think>`），logits Pearson 0.93；
@@ -115,7 +136,13 @@ make chat TEXT="你好，请用一句话介绍你自己。" MAX_NEW=8
 * 设备上 6 个 token 的文本 `<think>\n好的，，我…` 与仓库迁移前记录的验证结果
   逐 token 一致。
 
-运行时：32 token prefill 2,369,787 条指令（模拟器约 10 s，不含 791 MB dump）；
+运行时：32 token prefill，融合 mode 0 **2,454,977** 条指令，非融合 mode 1
+**2,364,735**（prefill-only 下 mode 1 不跑 argmax）。最后一层的
+Q/attention/O/MLP 只对需要 logits 的行算；非最终 prefill chunk 整段 tail 跳过
+（64 token prefill：4,438,896 → 4,392,666）。tile 指令是固定 32 行块，所以
+最终 chunk 的 1 行 tail 在指令数上几乎不降，收益在有效 MAC/访存；lm_head
+本来就只有 1 行。生成阶段 mode 0 不再写/读 logits，也不再跑 `argmax_logits`
+的 4,748 块标量往返。模拟器约 10 s，不含 791 MB dump；
 `build/qwen3_full.bin` 约 168 KB；`make data` 约 40 s（含参考前向）。
 
 ## blob 布局（`tools/pqwf.py` 生成，与 `config/model_big.h` 一致）
@@ -166,9 +193,30 @@ dtype），**不发 `acopy`/`vcopy`**：
 
 `make value-ops` 是这套语义的回归：19 个 case 各自算“值形式”和参考路径，
 逐位相同且与 numpy 一致（不需要模型，1 秒跑完）。其中 `tile dequant` 的参考
-路径是 `widen + to_fp32 + mul(byrow)`，`rsqrt` 用 `allclose(equal_nan=True)`。attention 里原来的
+路径是 `tdequant(ones) + mul(byrow)`（新 ISA 已删除 acvt/twiden，原来的
+`widen + to_fp32 + mul` 不再可编码），`rsqrt` 用 `allclose(equal_nan=True)`。attention 里原来的
 `corr.copy(maximum); corr.sub_(nmm)` 已改成 `Vec32 corr = maximum.sub(nmm)`，
 prefill 32 的指令数因此 2,370,235 → **2,369,787**（每 KV 块省 1 条 `vcopy`）。
+
+### 新 ISA（CVT 已删除）下的转换写法
+
+当前模拟器分支 `port-new-sim` 删除了 `acvt`/`vcvt`/`twiden`（`major4 = 0011`
+整体保留），所以 kernel 里所有 `to_fp32_()`/`widen()` 都必须换掉：
+
+| 旧写法 | 新写法 | 说明 |
+| --- | --- | --- |
+| `t.widen(a); a.to_fp32_(); a.mul_(s, byrow)` | `t.dequant(s, a)` | `tdequant.rows.f32`，i8×scale→f32 一条指令 |
+| `a.to_fp32_(); a.mul_(as, byrow); a.mul_(ws, bycol)` | `adequant(f, a, ws, as)` | 一条指令 = `f32(a)·ws[j]·as[i]`；gemm 的 epilogue 与 attention 的 QK scale 都是这个形态 |
+| `a.to_fp32_(); a.mul_(s, byrow)` | `adequant(f, a, ones, s)` | `f = f32(a)·1·s`；乘 1.0f 精确（O/PV 的 epilogue：scale 与分母/ps 分开乘） |
+
+`ones` 由 `kernels/io.h::config_ones` 生成，`adequant` 声明在 `include/tile.h`。
+gemm 快路径把 8 个 epilogue 共用的 f32 目的 acc 提到组外配置，每组只发 8 条
+`adequant`。
+
+**注意乘序**：`adequant` 是 `(x · vCol) · vRow`，而旧写法是 `(x · byrow) · bycol`。
+合并后每个元素差 1 ulp 级，经 int8 量化的边界会被放大：`ref_qwen3.py` 已按新乘序
+同步（`make check` 与新的 numpy 参考**逐位相同**），贪心生成的 token 与迁移前
+记录的一致，但 logits 绝对值会移动 0.1 量级（median |Δ|≈0.13）。
 
 ## 本轮修复的编译器编码错误
 
@@ -195,7 +243,7 @@ post-RA 的原地/派生形态展开）都在这套端到端测试里被覆盖�
 
 ## 已知限制
 
-* 只做贪心（设备端 `argmax_logits`）；采样需要 host 侧单步循环（`CTRL[3]=1`）。
+* 只做贪心（mode 0 为 `gemm_nt_argmax` 融合，mode 1 为非融合参考）；采样需要另加 host 侧单步接口。
 * `max_seq` 默认 256（blob 791 MB，其中 embedding + lm_head 占 312 MB）；
   `--max-seq` 改大只需重新生成 blob。
 * 与 fp32 相比是 w8a8 量化模型：top-1 一致、logits 有 ~1 量级漂移，长序列贪心

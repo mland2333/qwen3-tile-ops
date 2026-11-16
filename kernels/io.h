@@ -286,6 +286,22 @@ YAI_ALWAYS_INLINE void init_f32_acc_zero(Acc &a, std::uint8_t rows,
   a.fill(0.0f);
 }
 
+// 由计算写入的 f32 Acc（adequant 的目的）：只配 dtype+zone，不清零、不搬运。
+YAI_ALWAYS_INLINE void init_f32_acc(Acc &a, std::uint8_t rows,
+                                    std::uint8_t cols) {
+  a.set_dtype(AccDType::F32);
+  a.set_valid_zone(rows, cols);
+}
+
+// ones 向量：给 adequant 当"这一维不缩放"的 scale（len 按调用点再改）。
+// 新 ISA 删除了 acvt，`adequant(dst, src, ones, s)` 就是旧的
+// `acvt(src→dst); dst.mul_(s, byrow)`；乘 1.0f 精确，数值逐位不变。
+YAI_ALWAYS_INLINE void config_ones(Vec32 &x, std::uint8_t len = 32) {
+  x.set_dtype(Vec32DType::F32);
+  x.set_valid_zone(static_cast<std::int32_t>(len));
+  x.fill(1.0f);
+}
+
 YAI_ALWAYS_INLINE void init_i8_tile(Tile &t) {
   t.set_dtype(TileDType::I8);
   t.set_valid_zone(static_cast<std::uint8_t>(kBlock),

@@ -83,6 +83,20 @@ def quant_rows(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return quant_with_scale(matrix, scale), scale
 
 
+def quant_rows_heads(matrix: np.ndarray, group_cols: int) -> tuple[np.ndarray, np.ndarray]:
+    """``quant_rows_heads``: per-group/per-row absmax (Qwen3 head_dim=128)."""
+    rows, cols = matrix.shape
+    groups = cols // group_cols
+    absmax = np.max(
+        np.abs(matrix.reshape(rows, groups, group_cols)), axis=2).astype(F)
+    scale = (absmax * KINV127).astype(F)
+    out = np.empty_like(matrix, dtype=np.int8)
+    for g in range(groups):
+        out[:, g * group_cols:(g + 1) * group_cols] = quant_with_scale(
+            matrix[:, g * group_cols:(g + 1) * group_cols], scale[:, g])
+    return out, scale
+
+
 # ---------------------------------------------------------------------------
 # kernels
 # ---------------------------------------------------------------------------
@@ -115,11 +129,32 @@ def imatmul_nt(a8: np.ndarray, b8: np.ndarray, chunk: int = 4096) -> np.ndarray:
 
 def gemm_nt(a8: np.ndarray, a_scale: np.ndarray,
             w8: np.ndarray, w_scale: np.ndarray) -> np.ndarray:
-    """``gemm_nt``: i32 accumulate, then ``acvt`` + two f32 scale multiplies."""
+    """``gemm_nt``: i32 accumulate, then one ``adequant`` = f32 * ws[j] * as[i].
+
+    ``adequant`` 的乘序是 ``(x * vCol[j]) * vRow[i]``，所以先乘 w_scale（列），
+    再乘 a_scale（行）——旧的 ``acvt + amulv.byrow(as) + amulv.bycol(ws)`` 是
+    ``(x * as) * ws``，两者差 1 ulp 级；kernel 现在用合并写法，这里跟着对齐。
+    """
     acc = imatmul_nt(a8, w8).astype(np.int32)
     out = acc.astype(F)
-    out = (out * a_scale[:, None]).astype(F)
     out = (out * w_scale[None, :]).astype(F)
+    out = (out * a_scale[:, None]).astype(F)
+    return out
+
+
+def gemm_nt_group(a8: np.ndarray, a_scale: np.ndarray,
+                  w8: np.ndarray, w_scale: np.ndarray,
+                  group: int = 128) -> np.ndarray:
+    """Per-128 K-group GEMM: each group gets its own a_scale column."""
+    rows, k = a8.shape
+    n = w8.shape[0]
+    out = np.zeros((rows, n), dtype=F)
+    for g in range(k // group):
+        lo, hi = g * group, (g + 1) * group
+        part = imatmul_nt(a8[:, lo:hi], w8[:, lo:hi]).astype(np.int32).astype(F)
+        part = (part * w_scale[None, :]).astype(F)
+        part = (part * a_scale[:, g][:, None]).astype(F)
+        out = (out + part).astype(F)
     return out
 
 
@@ -192,10 +227,10 @@ def attention_head_blocks(q8: np.ndarray, q_scale: np.ndarray,
         nc = min(32, kv_len - j)
         # 1a) S = q8 . k8^T, i32
         s = imatmul_nt(q8, k8[j:j + nc]).astype(np.int32)
-        # 1b) dequantise + qk scale
+        # 1b) dequantise + qk scale：一条 adequant 的乘序是 (x * k) * q
         s = s.astype(F)
-        s = (s * q_scale[:, None]).astype(F)
         s = (s * k_scale[j:j + nc][None, :]).astype(F)
+        s = (s * q_scale[:, None]).astype(F)
         s = (s * qk_scale).astype(F)
         # 1c) causal mask
         if causal:
@@ -248,8 +283,8 @@ def attention_heads_gqa_tokscale(q8: np.ndarray, q_scale: np.ndarray,
         for qi in range(0, rows, 32):
             nr = min(32, rows - qi)
             out[qi:qi + nr, qc] = attention_head_blocks(
-                q8[qi:qi + nr, qc], q_scale[qi:qi + nr],
-                k8[:, kvc], k_scale, v8[:, kvc], v_scale,
+                q8[qi:qi + nr, qc], q_scale[qi:qi + nr, h],
+                k8[:, kvc], k_scale[:, kv], v8[:, kvc], v_scale[:, kv],
                 nr, kv_len, pos0 + qi, causal, qk_scale, hd)
     return out
 
@@ -314,14 +349,17 @@ class Cache:
     v_s: np.ndarray
 
 
-def new_cache(max_seq: int, kv_width: int) -> Cache:
-    return Cache(np.zeros((max_seq, kv_width), np.int8), np.zeros(max_seq, F),
-                 np.zeros((max_seq, kv_width), np.int8), np.zeros(max_seq, F))
+def new_cache(max_seq: int, kv_width: int, kv_heads: int) -> Cache:
+    return Cache(np.zeros((max_seq, kv_width), np.int8),
+                 np.zeros((max_seq, kv_heads), F),
+                 np.zeros((max_seq, kv_width), np.int8),
+                 np.zeros((max_seq, kv_heads), F))
 
 
 def new_caches(model: "Model") -> list[Cache]:
     """One KV cache per layer, like the device's per-layer cache blocks."""
-    return [new_cache(model.max_seq, model.kv_heads * model.head_dim)
+    return [new_cache(model.max_seq, model.kv_heads * model.head_dim,
+                      model.kv_heads)
             for _ in range(len(model.layers))]
 
 
@@ -347,10 +385,10 @@ def forward_chunk(model: Model, ids: np.ndarray, caches: list[Cache], pos: int,
         cache = caches[idx]
         if idx != 0:
             h = rmsnorm_rows(x, layer.n1, inv_h)
-        h8, hs = quant_rows(h)
-        q = gemm_nt(h8, hs, layer.wq, layer.wq_s)
-        k = gemm_nt(h8, hs, layer.wk, layer.wk_s)
-        v = gemm_nt(h8, hs, layer.wv, layer.wv_s)
+        h8, hs = quant_rows_heads(h, 256)
+        q = gemm_nt_group(h8, hs, layer.wq, layer.wq_s, group=256)
+        k = gemm_nt_group(h8, hs, layer.wk, layer.wk_s, group=256)
+        v = gemm_nt_group(h8, hs, layer.wv, layer.wv_s, group=256)
         # q/k norm + rope, per head
         for kvm in range(model.kv_heads):
             c0 = kvm * HD
@@ -362,29 +400,29 @@ def forward_chunk(model: Model, ids: np.ndarray, caches: list[Cache], pos: int,
             qh = q[:, c0:c0 + HD]
             qh = rmsnorm_rows(qh, layer.nq, inv_hd)
             q[:, c0:c0 + HD] = rope_head_hd(qh, cos_p, sin_p)
-        k8, ks = quant_rows(k)
-        v8, vs = quant_rows(v)
+        k8, ks = quant_rows_heads(k, HD)
+        v8, vs = quant_rows_heads(v, HD)
         cache.k8[pos:pos + rows] = k8
         cache.k_s[pos:pos + rows] = ks
         cache.v8[pos:pos + rows] = v8
         cache.v_s[pos:pos + rows] = vs
-        q8, qs = quant_rows(q)
+        q8, qs = quant_rows_heads(q, HD)
         kv_len = pos + rows
         attn = attention_heads_gqa_tokscale(
             q8, qs, cache.k8[:kv_len], cache.k_s[:kv_len],
             cache.v8[:kv_len], cache.v_s[:kv_len],
             model.heads, model.kv_heads, HD, True, qk_scale)
-        o8, os = quant_rows(attn)
-        o = gemm_nt(o8, os, layer.wo, layer.wo_s)
+        o8, os = quant_rows_heads(attn, HD)
+        o = gemm_nt_group(o8, os, layer.wo, layer.wo_s, group=HD)
         x = (x + o).astype(F)
 
         h = rmsnorm_rows(x, layer.n2, inv_h)
-        h8, hs = quant_rows(h)
-        g = gemm_nt(h8, hs, layer.wg, layer.wg_s)
-        u = gemm_nt(h8, hs, layer.wu, layer.wu_s)
+        h8, hs = quant_rows_heads(h, 256)
+        g = gemm_nt_group(h8, hs, layer.wg, layer.wg_s, group=256)
+        u = gemm_nt_group(h8, hs, layer.wu, layer.wu_s, group=256)
         sw = swiglu(g, u)
-        s8, ss = quant_rows(sw)
-        o = gemm_nt(s8, ss, layer.wd, layer.wd_s)
+        s8, ss = quant_rows_heads(sw, 256)
+        o = gemm_nt_group(s8, ss, layer.wd, layer.wd_s, group=256)
         x = (x + o).astype(F)
 
         if record is not None:
@@ -399,8 +437,8 @@ def forward_chunk(model: Model, ids: np.ndarray, caches: list[Cache], pos: int,
     if want_logits:
         last = x[rows - 1:rows]
         hl = rmsnorm_rows(last, model.nf, inv_h)
-        h8l, hsl = quant_rows(hl)
-        logits = gemm_nt(h8l, hsl, model.lm8, model.lm_s)
+        h8l, hsl = quant_rows_heads(hl, 256)
+        logits = gemm_nt_group(h8l, hsl, model.lm8, model.lm_s, group=256)
         if record is not None:
             record["logits"] = logits
     return logits

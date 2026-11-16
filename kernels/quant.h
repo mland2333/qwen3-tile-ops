@@ -76,6 +76,67 @@ YAI_OP_INLINE void quant_rows(const MatrixView &x, const MatrixView &qi8,
   }
 }
 
+// ---------------------------------------------------------------------------
+// quant_rows_heads：per-head/per-group int8 量化
+//
+//   x [rows][cols] f32 -> qi8 [rows][cols] i8 + scale [rows][groups] f32
+//   每个 group 是 group_cols 列（Qwen3 的 head_dim = 128），组内每行一个
+//   scale：scale[t][g] = absmax(x[t][g*group_cols:(g+1)*group_cols]) / 127。
+//
+// 这与 quant_rows 的区别只有 scale 的粒度：quant_rows 整行一个 scale，
+// 这里每组一个。op 内部仍然是"第一遍 absmax、第二遍 tquantx"。
+// ---------------------------------------------------------------------------
+YAI_OP_INLINE void quant_rows_heads(const MatrixView &x, const MatrixView &qi8,
+                                    const MatrixView &scale,
+                                    std::uint32_t group_cols) {
+  Acc b{};
+  config_acc(b, x);
+  Tile t{};
+  config_tile(t, qi8);
+  Vec32 sv{};
+  sv.set_dtype(Vec32DType::F32);
+  sv.set_stride(scale.row_bytes);
+
+  for (std::uint32_t m = 0; m < x.rows; m += kBlock) {
+    const std::uint8_t nr = block_zone(x.rows, m);
+    for (std::uint32_t g0 = 0; g0 < x.cols; g0 += group_cols) {
+      const std::uint32_t g = g0 / group_cols;
+      const std::uint32_t gcols = (x.cols - g0 < group_cols)
+                                      ? (x.cols - g0)
+                                      : group_cols;
+      // 第一遍：组内 absmax（跨 32 列块合并）
+      #pragma clang loop YAI_LOOP_UNROLL
+      for (std::uint32_t k = 0; k < gcols; k += kBlock) {
+        const std::uint8_t nc = block_zone(gcols, k);
+        set_zone(b, nr, nc);
+        load_acc_at(b, x.data + m * static_cast<std::uint32_t>(x.row_bytes) +
+                       (g0 + k) * static_cast<std::uint32_t>(x.col_bytes));
+        if (k == 0) {
+          sv = b.row_absmax();
+        } else {
+          b.row_absmax(sv);
+        }
+      }
+      sv.mul_(kInv127);
+      set_len(sv, nr);
+      store_vec_at(sv, scale.data + m * static_cast<std::uint32_t>(scale.row_bytes) +
+                       g * static_cast<std::uint32_t>(scale.col_bytes));
+      // 第二遍：用本组 scale 逐块量化
+      #pragma clang loop YAI_LOOP_UNROLL
+      for (std::uint32_t k = 0; k < gcols; k += kBlock) {
+        const std::uint8_t nc = block_zone(gcols, k);
+        set_zone(b, nr, nc);
+        load_acc_at(b, x.data + m * static_cast<std::uint32_t>(x.row_bytes) +
+                       (g0 + k) * static_cast<std::uint32_t>(x.col_bytes));
+        set_zone(t, nr, nc);
+        b.quant_ext(sv, t);
+        store_tile_at(t, qi8.data + m * static_cast<std::uint32_t>(qi8.row_bytes) +
+                         (g0 + k) * static_cast<std::uint32_t>(qi8.col_bytes));
+      }
+    }
+  }
+}
+
 } // namespace qwen3_ops
 
 #endif

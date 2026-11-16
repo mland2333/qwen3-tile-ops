@@ -191,7 +191,11 @@ int main() {
   CASE_VEC_UN("vrsqrt", a.rsqrt(), u.rsqrt_());
   // 34/35: Acc rcp
   CASE_ACC_UN("arcp", a.rcp(), u.rcp_());
-  // 36/37: tdequant vs widen + acvt + mul(byrow)
+  // 36/37: tdequant(scale) vs tdequant(ones) + mul(byrow)
+  //
+  // 新 ISA 删除了 acvt/twiden，所以旧参考路径 widen + acvt + mul 不再可编码；
+  // 改成等价的 "ones 版"：乘 1.0f 精确，两条路径应逐位相同。这正是 kernel 里
+  // adequant(ones, scale) 替代 acvt + mul 所依赖的性质。
   {
     Tile t{};
     t.set_dtype(TileDType::I8);
@@ -207,12 +211,15 @@ int main() {
     d.set_strides(COLS * 4, 4);
     t.dequant(s, d);
     store_acc(d, slots.take());
+    Vec32 one{};
+    one.set_dtype(Vec32DType::F32);
+    one.set_valid_zone(ROWS);
+    one.fill(1.0f);
     Acc r{};
-    r.set_dtype(AccDType::I32);
+    r.set_dtype(AccDType::F32);
     r.set_valid_zone(ROWS, COLS);
     r.set_strides(COLS * 4, 4);
-    t.widen(r);
-    r.to_fp32_();
+    t.dequant(one, r);
     r.mul_(s, true);
     store_acc(r, slots.take());
   }

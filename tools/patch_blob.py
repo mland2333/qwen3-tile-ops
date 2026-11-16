@@ -5,9 +5,11 @@
         --header build/model_big.h --ids 100,200 --n-gen 8 [--mode 0]
 
 The blob's control block is ``CTRL = [n_prompt, n_gen, max_seq, mode]``:
-mode 0 runs prefill + the built-in greedy loop, mode 1 runs a single decode
-step at absolute position ``n_prompt``.  Activations, logits and the KV cache
-are cleared so the file can be re-run without stale state.
+mode 0 fuses lm_head with argmax (production), mode 1 is the non-fused
+reference path (writes logits, then argmax_logits).  Activations, logits and
+the KV cache are cleared so the file can be re-run without stale state.
+``--mode-only`` only rewrites CTRL[3] and keeps the ids/state, which is useful
+for running the same blob through both modes.
 """
 
 from __future__ import annotations
@@ -40,10 +42,19 @@ def main() -> int:
     ap.add_argument("--n-gen", type=int, default=0)
     ap.add_argument("--mode", type=int, default=0)
     ap.add_argument("--keep-state", action="store_true",
-                    help="keep activations and the KV cache (host-side decode loop)")
+                    help="keep activations and the KV cache")
+    ap.add_argument("--mode-only", action="store_true",
+                    help="only rewrite CTRL[3]; keep ids and state untouched")
     args = ap.parse_args()
 
     consts, lay = read_layout(Path(args.header))
+    if args.mode_only:
+        with open(args.blob, "r+b") as handle:
+            handle.seek(lay["kCTRL"] + 3 * 4)
+            handle.write(struct.pack("<i", args.mode))
+        print(f"patched {args.blob}: mode={args.mode} (ids/state kept)")
+        return 0
+
     ids = [int(t) for t in args.ids.split(",") if t.strip()]
     if not ids:
         print("no ids given", file=sys.stderr)

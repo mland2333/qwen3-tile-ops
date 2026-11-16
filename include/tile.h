@@ -634,6 +634,21 @@ YAI_ALWAYS_INLINE Vec32Value yai_handle(const Vec32 &value) {
   return value.value_;
 }
 
+// ---- 向量比较 / 选择（E_CMP / E_R4）----
+// cmp_lt: mask = (a < b) ? 0xffffffffu : 0（u32 Vec32，shape 同 a）
+// select: result = mask ? a : b
+// 都是值形式：返回新的 Vec32，不改源；后端 post-RA 只补一条 cfg.copy 克隆
+// 描述符（vcmp 的 mask dtype 由 lowering 预先配成 u32），不搬数据。
+[[nodiscard]] YAI_ALWAYS_INLINE Vec32 cmp_lt(const Vec32 &a, const Vec32 &b) {
+  return Vec32(YAI_COMPILER_INTRINSIC(vec_cmp_lt)(yai_handle(a),
+                                                  yai_handle(b)));
+}
+[[nodiscard]] YAI_ALWAYS_INLINE Vec32 select(const Vec32 &a, const Vec32 &b,
+                                             const Vec32 &mask) {
+  return Vec32(YAI_COMPILER_INTRINSIC(vec_select)(yai_handle(a), yai_handle(b),
+                                                  yai_handle(mask)));
+}
+
 // 返回新逻辑值的操作：返回值本身将来由 intrinsic 降为新的 Acc/Vec32 SSA 值。
 YAI_ALWAYS_INLINE void Tile::dequant(const Vec32 &scale, Acc &out) const {
   YAI_COMPILER_INTRINSIC(tile_dequant)(value_, yai_handle(scale), yai_handle(out));
@@ -695,6 +710,17 @@ YAI_ALWAYS_INLINE Acc operator-(const Acc &a, const Acc &b) {
 }
 YAI_ALWAYS_INLINE Acc operator*(const Acc &a, const Acc &b) {
   return mul(a, b);
+}
+
+// adequant：aD(f32) = f32(aS[i,j]) * vCol[j] * vRow[i]
+// （源与目的必须是不同的 Acc；dst 需先配好 dtype=f32、zone=源 Acc 的 zone，
+//   vCol.len = 源 cols，vRow.len = 源 rows）。
+// 新 ISA 删除了 acvt/vcvt；i32 Acc → f32 走这条指令：col 取 ones 时它就是
+// acvt + bycol/row 的等价物（×1.0f 精确，不引入额外舍入）。
+YAI_ALWAYS_INLINE void adequant(Acc &dst, const Acc &src, const Vec32 &col,
+                                const Vec32 &row) {
+  YAI_COMPILER_INTRINSIC(acc_adequant)(yai_handle(dst), yai_handle(src),
+                                       yai_handle(col), yai_handle(row));
 }
 
 #undef YAI_COMPILER_INTRINSIC

@@ -27,9 +27,16 @@ HDR     := $(VDIR)/model_big.h
 DATA    := $(VDIR)/qwen3_big_data.bin
 REF     := $(VDIR)/ref.npz
 OUT     := $(VDIR)/out.bin
+CHECK_BLOB := $(BUILD)/check_blob.bin
 GUEST   := $(BUILD)/qwen3_$(VARIANT).bin
 OBJECT  := $(BUILD)/main_$(VARIANT).o
 BRIDGE  := $(BUILD)/sim_bridge
+LLVM_OBJDUMP ?= $(dir $(CLANG))llvm-objdump
+ASM_S   := $(BUILD)/main_$(VARIANT).s
+ASM_DBG_OBJ := $(BUILD)/main_$(VARIANT)_dbg.o
+ASM_DBG_ELF := $(BUILD)/qwen3_$(VARIANT)_dbg.elf
+ASM_TXT := $(BUILD)/qwen3_$(VARIANT)_asm.txt
+ASM_DIS := $(BUILD)/qwen3_$(VARIANT)_disasm.txt
 
 # x31 = blob base, x30 = stack top: fixed by the sim_bridge/crt0 convention, so
 # the compiler must not allocate them.
@@ -38,7 +45,7 @@ TARGET  := --target=riscv64-unknown-elf -march=rv64im_xaicore -mabi=lp64 \
 INC     := -I include -I $(VDIR) -I config
 KERNELS := $(wildcard kernels/*.h)
 
-.PHONY: all data big bridge check chat small value-ops clean help
+.PHONY: all data big bridge check chat small value-ops group-gemm asm clean help
 
 all: big
 
@@ -91,8 +98,58 @@ bridge: $(BRIDGE)
 
 # ---- run + per-stage comparison -------------------------------------------
 check: $(GUEST) $(BRIDGE) $(DATA) $(REF) $(HDR)
-	./$(BRIDGE) $(GUEST) $(DATA) $(OUT)
-	python3 tools/compare.py --header $(HDR) --out $(OUT) --ref $(REF)
+	@set -e; \
+	cp --reflink=auto $(DATA) $(CHECK_BLOB) 2>/dev/null || cp $(DATA) $(CHECK_BLOB); \
+	for mode in 0 1; do \
+	    python3 tools/patch_blob.py --blob $(CHECK_BLOB) --header $(HDR) \
+	        --mode-only --mode $$mode; \
+	    ./$(BRIDGE) $(GUEST) $(CHECK_BLOB) $(OUT); \
+	    if [ $$mode -eq 0 ]; then \
+	        python3 tools/compare.py --header $(HDR) --out $(OUT) --ref $(REF) --fused; \
+	    else \
+	        python3 tools/compare.py --header $(HDR) --out $(OUT) --ref $(REF); \
+	    fi; \
+	done
+
+# ---- assembly / disassembly text ------------------------------------------
+$(ASM_S): src/main_big.cpp $(KERNELS) include/tile.h $(HDR)
+	@mkdir -p $(BUILD)
+	$(CLANG) $(TARGET) $(INC) -S -fverbose-asm $< -o $@
+
+$(ASM_DBG_OBJ): src/main_big.cpp $(KERNELS) include/tile.h $(HDR)
+	@mkdir -p $(BUILD)
+	$(CLANG) $(TARGET) $(INC) -g -c $< -o $@
+	$(CROSS)objcopy --remove-section=.riscv.attributes $@ $@.link
+
+$(ASM_DBG_ELF): $(ASM_DBG_OBJ) $(BUILD)/crt0.o
+	$(CROSS)ld -T $(LINK_LD) $(ASM_DBG_OBJ).link $(BUILD)/crt0.o -o $@
+
+$(ASM_TXT): $(ASM_S)
+	@mkdir -p $(BUILD)
+	{ \
+	  echo "Qwen3 tile-NPU inference assembly"; \
+	  echo "variant: $(VARIANT)"; \
+	  echo "generated: $$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+	  echo "source: src/main_big.cpp + kernels/*.h (inlined)"; \
+	  echo "note: pre-link clang -S assembly; custom XAIcore mnemonics are authoritative."; \
+	  echo; \
+	  cat $(ASM_S); \
+	} > $@
+	@echo "asm: $@ ($$(stat -c%s $@) bytes)"
+
+$(ASM_DIS): $(ASM_DBG_ELF)
+	@mkdir -p $(BUILD)
+	{ \
+	  echo "Qwen3 tile-NPU inference linked disassembly"; \
+	  echo "variant: $(VARIANT)"; \
+	  echo "note: some custom XAIcore encodings may appear as <unknown> in llvm-objdump;"; \
+	  echo "      use $(ASM_TXT) for the named assembly."; \
+	  echo; \
+	  $(LLVM_OBJDUMP) -d -S --demangle --mattr=+xaicore $(ASM_DBG_ELF); \
+	} > $@
+	@echo "disasm: $@ ($$(stat -c%s $@) bytes)"
+
+asm: $(ASM_TXT) $(ASM_DIS)
 
 # ---- small end-to-end smoke test ------------------------------------------
 small:
@@ -111,6 +168,19 @@ $(BUILD)/value_ops.bin: tests/guest/value_ops.cpp include/tile.h $(BUILD)/crt0.o
 
 value-ops: $(BUILD)/value_ops.bin $(BRIDGE)
 	python3 tools/check_value_ops.py --guest $(BUILD)/value_ops.bin --bridge $(BRIDGE)
+
+# ---- per-group GEMM primitive test ---------------------------------------
+$(BUILD)/group_gemm.bin: tests/guest/group_gemm.cpp include/tile.h kernels/group_gemm.h $(BUILD)/crt0.o
+	@mkdir -p $(BUILD)
+	$(CLANG) $(TARGET) -mcmodel=medany $(INC) -c $< -o $(BUILD)/group_gemm_main.o
+	$(CROSS)objcopy --remove-section=.riscv.attributes $(BUILD)/group_gemm_main.o \
+	    $(BUILD)/group_gemm_main.o.link
+	$(CROSS)ld -T $(LINK_LD) $(BUILD)/group_gemm_main.o.link $(BUILD)/crt0.o \
+	    -o $(BUILD)/group_gemm.elf
+	$(CROSS)objcopy -O binary $(BUILD)/group_gemm.elf $@
+
+group-gemm: $(BUILD)/group_gemm.bin $(BRIDGE)
+	python3 tools/check_group_gemm.py --guest $(BUILD)/group_gemm.bin --bridge $(BRIDGE)
 
 # ---- text in / text out ----------------------------------------------------
 chat: $(GUEST) $(BRIDGE) $(HDR) $(DATA)

@@ -57,30 +57,34 @@ YAI_OP_INLINE void attention_head(const MatrixView &q8, const MatrixView &k8,
   qt.matmul(kt, s, /*zero=*/true, /*lt=*/false, /*rt=*/true);
 
   // ---- 4) 转 f32，乘 Q/K 两个量化 scale ----
-  s.to_fp32_();
-  s.mul_(qs, true);
-  s.mul_(ks, false);
+  // 新 ISA 无 acvt：一条 adequant 做 f32(s) * ks[j] * qs[i]。
+  Vec32 ones{};
+  config_ones(ones);            // O 的 epilogue 还要用
+  Acc sf{};
+  init_f32_acc(sf, static_cast<std::uint8_t>(block_zone(q8.rows, 0)),
+               static_cast<std::uint8_t>(block_zone(k8.rows, 0)));
+  adequant(sf, s, ks, qs);
 
   // ---- 5) 因果 mask：保留 j <= i（tril），上三角填 -inf ----
   if (causal) {
-    s.mask_(0);
+    sf.mask_(0);
   }
 
   // ---- 6) softmax（减行最大值 → exp2 → 除行和）----
-  Vec32 m = s.row_max();
-  s.sub_(m, true);
-  s.exp_();
-  Vec32 den = s.row_sum();
+  Vec32 m = sf.row_max();
+  sf.sub_(m, true);
+  sf.exp_();
+  Vec32 den = sf.row_sum();
   den.rcp_();
-  s.mul_(den, true);
+  sf.mul_(den, true);
 
   // ---- 7) 折叠 V 的 scale（见文件头说明）----
-  s.mul_(vs, false);
+  sf.mul_(vs, false);
 
   // ---- 8) 把 P 量化成 i8（每个 query 行一个 scale）----
-  Vec32 ps = s.row_absmax();
+  Vec32 ps = sf.row_absmax();
   ps.mul_(kInv127);
-  s.quant_ext(ps, qt);       // P 写回 qt（qt 已经用完）
+  sf.quant_ext(ps, qt);       // P 写回 qt（qt 已经用完）
 
   // ---- 9) O = P·Vᵀ，再乘 P 的行 scale 反量化 ----
   // ISA 只保留 mma.nt（D[m,n] = Σ_k A[m,k]·B[n,k]），所以右操作数要按 [n][k]
@@ -94,9 +98,13 @@ YAI_OP_INLINE void attention_head(const MatrixView &q8, const MatrixView &k8,
   Acc o{};
   init_i32_acc(o, block_zone(q8.rows, 0), block_zone(vT.rows, 0));
   qt.matmul(vt, o, /*zero=*/true, /*lt=*/false, /*rt=*/true);
-  o.to_fp32_();
-  o.mul_(ps, true);
-  store_acc(o, out, 0, 0);
+  // acvt + byrow(ps) → adequant(ones, ps)
+  const std::uint8_t ncols = block_zone(v8.cols, 0);
+  Acc of{};
+  init_f32_acc(of, static_cast<std::uint8_t>(block_zone(q8.rows, 0)), ncols);
+  set_len(ones, ncols);
+  adequant(of, o, ones, ps);
+  store_acc(of, out, 0, 0);
 }
 
 // ---------------------------------------------------------------------------

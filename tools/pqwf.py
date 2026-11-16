@@ -126,8 +126,13 @@ class Layout:
         return self.max_seq * self.kv_width
 
     @property
+    def kv_scale_bytes(self) -> int:
+        # per-head K/V scales: [max_seq][kv_heads]
+        return 4 * self.max_seq * self.kv_heads
+
+    @property
     def kv_stride(self) -> int:
-        return 2 * (self.kv_scale_off + 4 * self.max_seq)
+        return 2 * (self.kv_scale_off + self.kv_scale_bytes)
 
     def compute(self) -> "Layout":
         off = 0
@@ -181,30 +186,30 @@ class Layout:
 
         place("kH", 4 * self.seq * self.hidden)
         place("kH8", self.seq * self.hidden)
-        place("kHS", 256)
+        place("kHS", 4 * self.seq * (self.hidden // 256))
         place("kQ", 4 * self.seq * self.q_width)
         place("kK", 4 * self.seq * self.kv_width)
         place("kV", 4 * self.seq * self.kv_width)
         place("kQ8", self.seq * self.q_width)
         place("kK8", self.seq * self.kv_width)
         place("kV8", self.seq * self.kv_width)
-        place("kQS", 256)
-        place("kKS", 256)
-        place("kVS", 256)
+        place("kQS", 4 * self.seq * self.heads)
+        place("kKS", 4 * self.seq * self.kv_heads)
+        place("kVS", 4 * self.seq * self.kv_heads)
         place("kATTN", 4 * self.seq * self.q_width)
         place("kO", 4 * self.seq * self.hidden)
         place("kO8", self.seq * self.q_width)
-        place("kOS", 256)
+        place("kOS", 4 * self.seq * self.heads)
         place("kG", 4 * self.seq * self.inter)
         place("kU", 4 * self.seq * self.inter)
         place("kSW", 4 * self.seq * self.inter)
         place("kS8", self.seq * self.inter)
-        place("kSS", 256)
+        place("kSS", 4 * self.seq * (self.inter // 256))
         place("kARGF", 256)
         place("kARGI", 256)
         o["kKV_BASE"] = off  # the KV cache itself is sized by the layer count
         o["kKV_SOFF"] = self.kv_scale_off
-        o["kKV_VOFF"] = self.kv_scale_off + 4 * self.max_seq
+        o["kKV_VOFF"] = self.kv_scale_off + self.kv_scale_bytes
         o["kKV_STRIDE"] = self.kv_stride
         off += self.layers * self.kv_stride
         o["kSCRATCH_END"] = off
