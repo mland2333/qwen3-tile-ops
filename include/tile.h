@@ -199,8 +199,8 @@ struct Tile {
   //             acc_i32 是不同 Acc（adequant 的源/目的约束）。
   //   vcol/vrow: f32 Vec32，len 分别为 out 的 cols/rows。
   // 语义等价于 matmul(right, acc_i32, ...) + adequant(out_f32, acc_i32,
-  // vcol, vrow)，但通过专用 builtin + pseudo 保证两条指令相邻，便于硬件
-  // 检测 drain 融合。
+  // vcol, vrow)。硬件按 Acc 依赖识别 drain 融合：adequant 的源 Acc 等于
+  // 最近一次 mma 的目标 Acc 即可，中间允许插入其它指令。
   YAI_ALWAYS_INLINE void matmul_dequant(const Tile &right, Acc &acc_i32,
                                         Acc &out_f32, const Vec32 &vcol,
                                         const Vec32 &vrow, bool zero, bool lt,
@@ -724,11 +724,11 @@ YAI_ALWAYS_INLINE void Tile::matmul_dequant(const Tile &right, Acc &acc_i32,
                                               Acc &out_f32, const Vec32 &vcol,
                                               const Vec32 &vrow, bool zero,
                                               bool lt, bool rt) const {
-  // 专用 builtin：LLVM 会 lowering 成 XAIcoreMMANTDequant{zero,acc}
-  // pseudo，post-RA 展开为相邻的 mma.nt + adequant，保证 drain 序列。
-  YAI_COMPILER_INTRINSIC(tile_matmul_dequant)(
-      value_, yai_handle(right), yai_handle(acc_i32), yai_handle(out_f32),
-      yai_handle(vcol), yai_handle(vrow), zero, lt, rt);
+  // 语义等价于 matmul + adequant。硬件只需要看到“adequant 的源 Acc
+  // 是最近一次 mma 的目标 Acc”，中间允许插入其它指令；因此不需要 peel
+  // K 循环，也不需要强制两条指令相邻。
+  matmul(const_cast<Tile &>(right), acc_i32, zero, lt, rt);
+  adequant(out_f32, acc_i32, vcol, vrow);
 }
 
 #undef YAI_COMPILER_INTRINSIC
