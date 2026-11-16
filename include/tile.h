@@ -194,13 +194,9 @@ struct Tile {
                                         yai_handle(acc), zero, lt, rt);
   }
   // tdequant.rows.f32：out[i,j] = f32(tile[i,j]) * scale[i]。
-  // 与 widen 一样是"写进已有寄存器的目的"，out 必须由调用方先配好
-  // dtype=f32、valid_zone = tile 的有效形状；scale 的 vc.len = tile 行数。
-  // ISA 只提供按行（per-row）反量化，没有按列的形态。
+  // out 必须由调用方先配好 dtype=f32、valid_zone = tile 的有效形状；
+  // scale 的 vc.len = tile 行数。ISA 只提供按行（per-row）反量化。
   YAI_ALWAYS_INLINE void dequant(const Vec32 &scale, Acc &out) const;
-  // Tile i8 -> Acc i32 符号扩展（embedding 的 widen）；out 需先配好
-  // dtype=i32、valid_zone = tile 形状。
-  YAI_ALWAYS_INLINE void widen(Acc &out) const;
 };
 
 struct Acc {
@@ -317,10 +313,6 @@ struct Acc {
     YAI_COMPILER_INTRINSIC(acc_quant_ext)(value_, yai_handle(scale),
                                           yai_handle(tile));
   }
-  YAI_ALWAYS_INLINE void to_fp32_() {
-    YAI_COMPILER_INTRINSIC(acc_to_fp32)(value_);
-  }
-
   YAI_ALWAYS_INLINE void add_(const Acc &b) {
     YAI_COMPILER_INTRINSIC(acc_add_inplace)(value_, yai_handle(b));
   }
@@ -653,10 +645,6 @@ YAI_ALWAYS_INLINE Vec32Value yai_handle(const Vec32 &value) {
 YAI_ALWAYS_INLINE void Tile::dequant(const Vec32 &scale, Acc &out) const {
   YAI_COMPILER_INTRINSIC(tile_dequant)(value_, yai_handle(scale), yai_handle(out));
 }
-YAI_ALWAYS_INLINE void Tile::widen(Acc &out) const {
-  YAI_COMPILER_INTRINSIC(tile_widen)(value_, yai_handle(out));
-}
-
 YAI_ALWAYS_INLINE Vec32 Acc::row_max() const {
   return Vec32(YAI_COMPILER_INTRINSIC(acc_row_max)(value_));
 }
