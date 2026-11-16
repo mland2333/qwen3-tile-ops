@@ -189,12 +189,13 @@ YAI_ALWAYS_INLINE void pv_block(Acc &res, Tile &pt, Tile &vt, Acc &part,
   load_tile_at(vt, v8.data + d * static_cast<std::uint32_t>(v8.row_bytes) +
                        j * static_cast<std::uint32_t>(v8.col_bytes));
   part.set_dtype(AccDType::I32);   // 上一轮计算会把它改成 f32
-  pt.matmul(vt, part, /*zero=*/true, /*lt=*/false, /*rt=*/true);
-  // acvt 已删除：adequant(ones, pmax) == acvt + byrow(pmax)（×1 精确）。
+  // 新 ISA 的 drain 序列：mma 后紧跟 adequant，由 Tile API 的
+  // matmul_dequant 生成一个 pseudo，post-RA 展开成相邻两条。
   Acc pf{};
   init_f32_acc(pf, rows, static_cast<std::uint8_t>(kBlock));
   set_len(ones, static_cast<std::uint8_t>(kBlock));
-  adequant(pf, part, ones, pmax);
+  pt.matmul_dequant(vt, part, pf, ones, pmax, /*zero=*/true, /*lt=*/false,
+                    /*rt=*/true);
   res.add_(pf);                    // 累加
 }
 
