@@ -54,16 +54,15 @@ YAI_OP_INLINE void attention_head(const MatrixView &q8, const MatrixView &k8,
   // ---- 3) S = q8·k8ᵀ（右操作数逻辑转置：rt=true），i32 累加器 ----
   Acc s{};
   init_i32_acc(s, block_zone(q8.rows, 0), block_zone(k8.rows, 0));
-  qt.matmul(kt, s, /*zero=*/true, /*lt=*/false, /*rt=*/true);
-
   // ---- 4) 转 f32，乘 Q/K 两个量化 scale ----
-  // 新 ISA 无 acvt：一条 adequant 做 f32(s) * ks[j] * qs[i]。
+  // 新 ISA 无 acvt：matmul_dequant 把 mma + adequant 作为相邻的 drain 序列。
   Vec32 ones{};
   config_ones(ones);            // O 的 epilogue 还要用
   Acc sf{};
   init_f32_acc(sf, static_cast<std::uint8_t>(block_zone(q8.rows, 0)),
                static_cast<std::uint8_t>(block_zone(k8.rows, 0)));
-  adequant(sf, s, ks, qs);
+  qt.matmul_dequant(kt, s, sf, ks, qs, /*zero=*/true, /*lt=*/false,
+                    /*rt=*/true);
 
   // ---- 5) 因果 mask：保留 j <= i（tril），上三角填 -inf ----
   if (causal) {
@@ -97,13 +96,13 @@ YAI_OP_INLINE void attention_head(const MatrixView &q8, const MatrixView &k8,
   load_tile(vt, vT, 0, 0);
   Acc o{};
   init_i32_acc(o, block_zone(q8.rows, 0), block_zone(vT.rows, 0));
-  qt.matmul(vt, o, /*zero=*/true, /*lt=*/false, /*rt=*/true);
   // acvt + byrow(ps) → adequant(ones, ps)
   const std::uint8_t ncols = block_zone(v8.cols, 0);
   Acc of{};
   init_f32_acc(of, static_cast<std::uint8_t>(block_zone(q8.rows, 0)), ncols);
   set_len(ones, ncols);
-  adequant(of, o, ones, ps);
+  qt.matmul_dequant(vt, o, of, ones, ps, /*zero=*/true, /*lt=*/false,
+                    /*rt=*/true);
   store_acc(of, out, 0, 0);
 }
 

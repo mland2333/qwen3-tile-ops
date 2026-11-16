@@ -116,13 +116,13 @@ YAI_OP_INLINE void attention_head_hd(const MatrixView &q8,
     load_tile_at(vt, vT.data + n);
     Acc o{};
     init_i32_acc(o, static_cast<std::uint8_t>(rows), block_zone(v8.cols, n));
-    pt.matmul(vt, o, /*zero=*/true, /*lt=*/false, /*rt=*/true);
     // acvt + byrow(ps) + byrow(den) → adequant(ones, ps) + byrow(den)
     const std::uint8_t ncols = block_zone(v8.cols, n);
     Acc of{};
     init_f32_acc(of, static_cast<std::uint8_t>(rows), ncols);
     set_len(ones, ncols);
-    adequant(of, o, ones, ps);
+    pt.matmul_dequant(vt, o, of, ones, ps, /*zero=*/true, /*lt=*/false,
+                      /*rt=*/true);
     of.mul_(den, true);
     store_acc(of, out, 0, n);
   }

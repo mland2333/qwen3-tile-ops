@@ -145,7 +145,7 @@ YAI_OP_INLINE void gemm_nt_group_argmax(const MatrixView &a,
         at.matmul(bt2, part2, true, false, true);
         at.matmul(bt3, part3, true, false, true);
       }
-      for (std::uint32_t kk = ZB; kk < group_k; kk += ZB) {
+      for (std::uint32_t kk = ZB; kk + ZB < group_k; kk += ZB) {
         const std::uint8_t nc = block_zone(K, k0 + kk);
         set_zone(at, rows, nc);
         load_tile_at(at, a.data + (k0 + kk) * static_cast<std::uint32_t>(a.col_bytes));
@@ -166,13 +166,32 @@ YAI_OP_INLINE void gemm_nt_group_argmax(const MatrixView &a,
         at.matmul(bt2, part2, false, false, true);
         at.matmul(bt3, part3, false, false, true);
       }
-      set_len(asv, rows);
-      load_vec_at(asv, a_scale.data + (k0 / group_k) * 4);
-      adequant(pf0, part0, bs0, asv);
-      adequant(pf1, part1, bs1, asv);
-      adequant(pf2, part2, bs2, asv);
-      adequant(pf3, part3, bs3, asv);
-      acc0.add_(pf0); acc1.add_(pf1); acc2.add_(pf2); acc3.add_(pf3);
+      // 最后一个 K 块：mma + drain；前面的块已经累加到 part。
+      {
+        const std::uint32_t kk = group_k - ZB;
+        const std::uint8_t nc = block_zone(K, k0 + kk);
+        set_zone(at, rows, nc);
+        load_tile_at(at, a.data + (k0 + kk) * static_cast<std::uint32_t>(a.col_bytes));
+        set_zone(bt0, ZB, nc);
+        load_tile_at(bt0, b.data + (n0 + 0 * ZB) * static_cast<std::uint32_t>(b.row_bytes) +
+                          (k0 + kk) * static_cast<std::uint32_t>(b.col_bytes));
+        set_zone(bt1, ZB, nc);
+        load_tile_at(bt1, b.data + (n0 + 1 * ZB) * static_cast<std::uint32_t>(b.row_bytes) +
+                          (k0 + kk) * static_cast<std::uint32_t>(b.col_bytes));
+        set_zone(bt2, ZB, nc);
+        load_tile_at(bt2, b.data + (n0 + 2 * ZB) * static_cast<std::uint32_t>(b.row_bytes) +
+                          (k0 + kk) * static_cast<std::uint32_t>(b.col_bytes));
+        set_zone(bt3, ZB, nc);
+        load_tile_at(bt3, b.data + (n0 + 3 * ZB) * static_cast<std::uint32_t>(b.row_bytes) +
+                          (k0 + kk) * static_cast<std::uint32_t>(b.col_bytes));
+        set_len(asv, rows);
+        load_vec_at(asv, a_scale.data + (k0 / group_k) * 4);
+        at.matmul_dequant(bt0, part0, pf0, bs0, asv, false, false, true);
+        at.matmul_dequant(bt1, part1, pf1, bs1, asv, false, false, true);
+        at.matmul_dequant(bt2, part2, pf2, bs2, asv, false, false, true);
+        at.matmul_dequant(bt3, part3, pf3, bs3, asv, false, false, true);
+        acc0.add_(pf0); acc1.add_(pf1); acc2.add_(pf2); acc3.add_(pf3);
+      }
     }
     argmax_epilogue_f32(acc0, best, bidx, rows, ZB, n0 + 0 * ZB);
     argmax_epilogue_f32(acc1, best, bidx, rows, ZB, n0 + 1 * ZB);
