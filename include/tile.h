@@ -304,11 +304,8 @@ struct Acc {
                               float value = -3.402823466e+38F) {
     YAI_COMPILER_INTRINSIC(acc_mask)(value_, diag, value);
   }
-  YAI_ALWAYS_INLINE void quant(Vec32 &max, Tile &tile) {
-    YAI_COMPILER_INTRINSIC(acc_quant)(value_, yai_handle(max),
-                                      yai_handle(tile));
-  }
-  // 用给定的 per-row scale 量化（不修改 scale），对应 tquantx.rows。
+  // 用给定的 per-row scale 量化（不修改 scale），对应 aquant.rows.q8s32 的
+  // 显式 scale 形式。
   YAI_ALWAYS_INLINE void quant_ext(Vec32 &scale, Tile &tile) {
     YAI_COMPILER_INTRINSIC(acc_quant_ext)(value_, yai_handle(scale),
                                           yai_handle(tile));
