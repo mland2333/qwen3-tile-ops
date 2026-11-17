@@ -214,8 +214,6 @@ YAI_ALWAYS_INLINE void forward_chunk(const ModelViews &w, std::uint32_t pos,
     MatrixView o8t = rows_of(w.o8, tr0, tr);
     MatrixView ost = rows_of(w.os, tr0, tr);
     MatrixView ot = rows_of(w.o, tr0, tr);
-    MatrixView gt = rows_of(w.g, tr0, tr);
-    MatrixView ut = rows_of(w.u, tr0, tr);
     MatrixView s8t = rows_of(w.s8, tr0, tr);
     MatrixView sst = rows_of(w.ss, tr0, tr);
     // rope 表按绝对位置取行；tail 可能从 rows-1 开始
@@ -238,9 +236,7 @@ YAI_ALWAYS_INLINE void forward_chunk(const ModelViews &w, std::uint32_t pos,
     // SwiGLU
     rmsnorm_rows(xt, lv.n2, ht, 1.0f / H);
     quant_rows_heads(ht, h8t, hst, 256);
-    gemm_nt_group_store(h8t, hst, lv.wg, lv.wgs, gt, 256);
-    gemm_nt_group_store(h8t, hst, lv.wu, lv.wus, ut, 256);
-    swiglu_quant_heads(gt, ut, s8t, sst);
+    gemm_gate_up_swiglu_quant(h8t, hst, lv.wg, lv.wgs, lv.wu, lv.wus, s8t, sst);
     gemm_nt_group_store(s8t, sst, lv.wd, lv.wds, ot, 256, &xt);
   }
 

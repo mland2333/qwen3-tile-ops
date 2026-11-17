@@ -182,6 +182,19 @@ $(BUILD)/group_gemm.bin: tests/guest/group_gemm.cpp include/tile.h kernels/group
 group-gemm: $(BUILD)/group_gemm.bin $(BRIDGE)
 	python3 tools/check_group_gemm.py --guest $(BUILD)/group_gemm.bin --bridge $(BRIDGE)
 
+# ---- isolated gate/up fusion test ----------------------------------------
+$(BUILD)/gate_up.bin: tests/guest/gate_up.cpp include/tile.h kernels/group_gemm.h kernels/swiglu_quant.h $(BUILD)/crt0.o
+	@mkdir -p $(BUILD)
+	$(CLANG) $(TARGET) -mcmodel=medany $(INC) -c $< -o $(BUILD)/gate_up_main.o
+	$(CROSS)objcopy --remove-section=.riscv.attributes $(BUILD)/gate_up_main.o \
+	    $(BUILD)/gate_up_main.o.link
+	$(CROSS)ld -T $(LINK_LD) $(BUILD)/gate_up_main.o.link $(BUILD)/crt0.o \
+	    -o $(BUILD)/gate_up.elf
+	$(CROSS)objcopy -O binary $(BUILD)/gate_up.elf $@
+
+gate-up: $(BUILD)/gate_up.bin $(BRIDGE)
+	python3 tools/check_gate_up.py --guest $(BUILD)/gate_up.bin --bridge $(BRIDGE)
+
 # ---- text in / text out ----------------------------------------------------
 chat: $(GUEST) $(BRIDGE) $(HDR) $(DATA)
 	python3 tools/run_chat.py "$(TEXT)" --max-new $(or $(MAX_NEW),8) \
