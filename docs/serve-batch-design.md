@@ -1,10 +1,33 @@
-# Route B: strict batch QKV/O/MLP (design only)
+# Route B: strict batch QKV/O/MLP
 
-Status: **not implemented**.  The current serve guest is route A
-(host-batched, guest-sequential): `Serve.run` packs up to 8 items, but
-`src/serve.cpp` still calls `forward_chunk` once per item.  This document is
-the separate route-B design task and is intentionally not mixed into the
-route-A cleanup/tests commit.
+Status: **implemented** in `src/serve_batch.cpp` as `build/serve_batch.bin`.
+The route-A guest (`src/serve.cpp`) remains the sequential reference.  Both
+use the same `ServeCmd` ABI and the generated `serve_layout.h`.
+
+## Implementation notes
+
+- The host ABI is unchanged: an item's `rows` are packed in order, so the
+  guest derives `row_start` by summing rows.  The host scheduler therefore
+  needed no route-B-specific encoding.
+- `ServeItem` carries per-item `ptab`, `logits` and `ids` blobs; the guest
+  gathers a contiguous `[total_rows][1]` id vector for one batch embedding.
+- Q/K rope uses a gathered per-row cos/sin scratch (`kCos`/`kSin`), because
+  rows in one batch have different absolute positions.
+- K/V are written to contiguous `w.k8/v8/ks/vs` staging and then scattered
+  with `paged_kv_scatter_batch`, one table/token per row.
+- Attention is one `attention_heads_gqa_tokscale_paged` call per request
+  segment; rows of a request are contiguous.
+- O and MLP are one GEMM over all rows with the residual add against the
+  batch `x` rows.  lm_head runs once per item that needs logits, into that
+  item's logits slot.
+- Production has no debug buffers.  `total_rows <= kSeq` is enforced by the
+  guest; the host scheduler already caps the batch at 32 rows.
+
+## Verification
+
+`make serve-batch-test`, `make serve-batch-test-long`, and
+`make serve-batch-test-pages` all pass on the full model; the short test
+produces the same token sequences as route A and as single-request runs.
 
 ## Goal
 
@@ -19,32 +42,29 @@ One guest call per scheduler step, with a shared row batch:
 Total rows stay within the existing `kSeq` activation buffers (32 for the
 current model).
 
-## ABI
+## ABI (implemented)
 
-Replace the per-item `ServeItem` loop with a batch descriptor:
+Route B reuses the route-A `ServeCmd` unchanged:
 
 ```cpp
-struct BatchItem {
-  uint32_t row_start;   // first activation row
-  uint32_t rows;        // contiguous rows for this request
-  uint32_t pos;         // absolute position of row_start
-  uint32_t ptab;        // blob offset of this request's page table
-  uint32_t logits;      // blob offset of this request's logits slot
-  uint32_t ids;         // blob offset of this request's token-id slot
-  uint32_t needs;       // write logits (last prefill chunk / decode)
+struct ServeItem {
+  uint32_t rows;
+  uint32_t pos;
+  uint32_t ptab;
+  uint32_t logits;
+  uint32_t needs;
+  uint32_t ids;
 };
-struct BatchDesc {
+struct ServeCmd {
   uint32_t n;
-  BatchItem items[8];
+  ServeItem items[8];
 };
 ```
 
-The host `ReservingScheduler` already produces exactly this information; the
-route-B guest consumes it as a row map.
-
-Keep the generated `serve_layout.py` ABI handshake (cmd / page tables /
-logits / ids / end) and extend it with any route-B tables.  Host and guest must
-continue to share one layout source.
+The guest derives `row_start[0..n)` by summing `rows` in order; no separate
+`BatchDesc` allocation or host encoding is needed.  The generated
+`serve_layout.py` ABI handshake is shared by both guests (cmd / page tables /
+logits / ids / batch cos/sin / end).
 
 ## Data path
 
@@ -76,8 +96,8 @@ Reuse the route-A `ReservingScheduler`:
 - prefill in 32-token chunks (page aligned); decode in one-row items;
 - request completion releases pages and admits the next waiting request.
 
-Route B removes the route-A constraint that a prefill chunk must start on a
-page boundary, because K/V is scattered per row.
+Route B's K/V scatter is per row and does not itself require page alignment;
+the current host scheduler still uses page-aligned 32-token prefill chunks.
 
 ## Milestones and acceptance
 
@@ -90,9 +110,10 @@ page boundary, because K/V is scattered per row.
 - **B3**: per-request attention segments.  Compare `o8/os` per row; cover
   different `kv_len` and causal positions in one batch.
 - **B4**: batch O/MLP and per-request lm_head.  Compare `x`, `logits[item]`.
-- **B5**: end-to-end `make serve-b-test`, `serve-b-test-long`,
-  `serve-b-test-pages`; batch tokens == single tokens, page table and K/V
-  equal, no debug writes in production.
+- **B5**: end-to-end `make serve-batch-test`, `make serve-batch-test-long`,
+  `make serve-batch-test-pages`; batch tokens == single tokens, page table and
+  K/V equal, no debug writes in production.  *Implemented and verified on the
+  full model.*
 
 Add `YAI_SERVE_BATCH_DEBUG` only for stage dumps; production stays clean.
 

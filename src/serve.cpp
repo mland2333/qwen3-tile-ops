@@ -9,7 +9,8 @@
 #include "../kernels/qwen3.h"
 #include "../kernels/rope_gqa.h"
 #include "model_big.h"
-#include "serve_layout.h"
+#include "serve_abi.h"
+#include "serve_views.h"
 
 // Serve guest (route A: host-batched, guest-sequential).
 //
@@ -22,120 +23,7 @@
 // and Python cannot drift apart.  Production touches only cmd / page tables /
 // per-item logits; sentinel/snap/dump/before exist only in the debug namespace
 // and are compiled into build/serve_debug.bin with -DYAI_SERVE_DEBUG.
-#ifdef YAI_SERVE_DEBUG
-namespace serve_abi = serve_layout::debug;
-#else
-namespace serve_abi = serve_layout::prod;
-#endif
-
 namespace qwen3_ops {
-
-// 模型的全部视图（地址/形状/跨步），按块传给前向函数。
-struct ModelViews {
-  std::byte *blob;
-  MatrixView ids, x, emb, emb_s, lm, lm_s, nf, cos_t, sin_t;
-  MatrixView h, h8, hs, q, k, v, q8, qs, attn, o, o8, os;
-  MatrixView g, u, sw, s8, ss, logits, argf, argi;
-};
-
-// 一层的权重/量化 scale/norm 与 KV cache 视图。偏移只在这里算一次，
-// 层循环里不再出现 kLK-kLQ 这类减法。
-struct LayerViews {
-  MatrixView wq, wk, wv, wo, wg, wu, wd;              // [out][in] i8
-  MatrixView wqs, wks, wvs, wos, wgs, wus, wds;       // [out][1] f32
-  MatrixView n1, nq, nk, n2;                          // [len][1] f32
-  MatrixView kcache, kcscale, vcache, vcscale;        // KV cache
-};
-
-// 全局缓冲：一张表一行，形状全部来自 model_big.h。
-YAI_ALWAYS_INLINE void make_model_views(ModelViews &w, std::byte *blob) {
-  constexpr std::uint32_t H = mb::kHidden;
-  constexpr std::uint32_t HD = mb::kHeadDim;
-  constexpr std::uint32_t QW = mb::kHeads * HD;
-  constexpr std::uint32_t KW = mb::kKvHeads * HD;
-  constexpr std::uint32_t N = mb::kSeq;
-  constexpr std::uint32_t V = mb::kVocab;
-  constexpr std::uint32_t I = mb::kInter;
-  constexpr std::uint32_t HALF = mb::kHalf;
-  constexpr std::uint32_t MS = mb::kMaxSeq;
-
-  w = ModelViews{};
-  w.blob  = blob;
-  w.ids   = i32_view(blob + mb::kIDS, MS, 1);
-  w.x     = f32_view(blob + mb::kX, N, H);
-  w.emb   = i8_view(blob + mb::kEMB, V, H);
-  w.emb_s = f32_view(blob + mb::kEMB + V * H, V, 1);
-  w.lm    = i8_view(blob + mb::kLM, V, H);
-  w.lm_s  = f32_view(blob + mb::kLM + V * H, V, 1);
-  w.nf    = f32_view(blob + mb::kNF, H, 1);
-  w.cos_t = f32_view(blob + mb::kCOS, MS, HALF);
-  w.sin_t = f32_view(blob + mb::kSIN, MS, HALF);
-  w.h     = f32_view(blob + mb::kH, N, H);
-  w.h8    = i8_view(blob + mb::kH8, N, H);
-  w.hs    = f32_view(blob + mb::kHS, N, mb::kHidden / 256);
-  w.q     = f32_view(blob + mb::kQ, N, QW);
-  w.k     = f32_view(blob + mb::kK, N, KW);
-  w.v     = f32_view(blob + mb::kV, N, KW);
-  w.q8    = i8_view(blob + mb::kQ8, N, QW);
-  w.qs    = f32_view(blob + mb::kQS, N, mb::kHeads);
-  w.attn  = f32_view(blob + mb::kATTN, N, QW);
-  w.o     = f32_view(blob + mb::kO, N, H);
-  w.o8    = i8_view(blob + mb::kO8, N, QW);
-  w.os    = f32_view(blob + mb::kOS, N, mb::kHeads);
-  w.g     = f32_view(blob + mb::kG, N, I);
-  w.u     = f32_view(blob + mb::kU, N, I);
-  w.sw    = f32_view(blob + mb::kSW, N, I);
-  w.s8    = i8_view(blob + mb::kS8, N, I);
-  w.ss    = f32_view(blob + mb::kSS, N, I / 256);
-  w.logits = f32_view(blob + mb::kLOGITS, N, V);
-  w.argf  = f32_view(blob + mb::kARGF, N, 1);
-  w.argi  = i32_view(blob + mb::kARGI, N, 1);
-}
-
-// 第 L 层的全部视图：weight 段 / norm 段 / KV 段各一个基址。
-YAI_ALWAYS_INLINE void make_layer_views(LayerViews &v, std::byte *blob, int L) {
-  constexpr std::uint32_t H = mb::kHidden;
-  constexpr std::uint32_t HD = mb::kHeadDim;
-  constexpr std::uint32_t QW = mb::kHeads * HD;
-  constexpr std::uint32_t KW = mb::kKvHeads * HD;
-  constexpr std::uint32_t I = mb::kInter;
-  constexpr std::uint32_t MS = mb::kMaxSeq;
-
-  std::byte *lw = blob + mb::kLQ + L * mb::kLAYERW_STRIDE;
-  std::byte *ln = blob + mb::kN1 + L * mb::kLAYERN_STRIDE;
-  std::byte *kv = blob + mb::kKV_BASE + L * mb::kKV_STRIDE;
-
-  v = LayerViews{};
-  v.wq = i8_view(lw, QW, H);
-  v.wk = i8_view(lw + (mb::kLK - mb::kLQ), KW, H);
-  v.wv = i8_view(lw + (mb::kLV - mb::kLQ), KW, H);
-  v.wo = i8_view(lw + (mb::kLO - mb::kLQ), H, QW);
-  v.wg = i8_view(lw + (mb::kLG - mb::kLQ), I, H);
-  v.wu = i8_view(lw + (mb::kLU - mb::kLQ), I, H);
-  v.wd = i8_view(lw + (mb::kLD - mb::kLQ), H, I);
-  v.wqs = f32_view(lw + (mb::kLQ_SCALE - mb::kLQ), QW, 1);
-  v.wks = f32_view(lw + (mb::kLK_SCALE - mb::kLQ), KW, 1);
-  v.wvs = f32_view(lw + (mb::kLV_SCALE - mb::kLQ), KW, 1);
-  v.wos = f32_view(lw + (mb::kLO_SCALE - mb::kLQ), H, 1);
-  v.wgs = f32_view(lw + (mb::kLG_SCALE - mb::kLQ), I, 1);
-  v.wus = f32_view(lw + (mb::kLU_SCALE - mb::kLQ), I, 1);
-  v.wds = f32_view(lw + (mb::kLD_SCALE - mb::kLQ), H, 1);
-  v.n1 = f32_view(ln, H, 1);
-  v.nq = f32_view(ln + (mb::kNQ - mb::kN1), HD, 1);
-  v.nk = f32_view(ln + (mb::kNK - mb::kN1), HD, 1);
-  v.n2 = f32_view(ln + (mb::kN2 - mb::kN1), H, 1);
-  // KV cache：[max_seq][KW] i8 + [max_seq][kv_heads] f32 scale（k 段 + v 段）
-  v.kcache  = i8_view(kv, MS, KW);
-  v.kcscale = f32_view(kv + mb::kKV_SOFF, MS, mb::kKvHeads);
-  v.vcache  = i8_view(kv + mb::kKV_VOFF, MS, KW);
-  v.vcscale = f32_view(kv + mb::kKV_VOFF + mb::kKV_SOFF, MS, mb::kKvHeads);
-}
-
-// lm_head 的输出形式：
-//   None   ：不跑 final-norm/lm_head（prefill 的非最后一块）
-//   Logits ：写完整 logits（mode 1 非融合参考路径）
-//   Argmax ：融合 lm_head+argmax，只把 (best, bidx) 写进 argf/argi（生产路径）
-enum class LmHeadOut { None, Logits, Argmax };
 
 // 一块 token（rows <= kSeq）的完整前向。pos 是本块第一个 token 的绝对位置。
 // ids 非空时直接读调用方给的 per-item token 槽位；为空时沿用 w.ids[pos]。
@@ -330,46 +218,6 @@ YAI_ALWAYS_INLINE std::uint32_t fused_argmax_id(const ModelViews &w) {
 
 } // namespace qwen3_ops
 
-namespace {
-struct ServeItem {
-  std::uint32_t rows;
-  std::uint32_t pos;
-  std::uint32_t ptab;    // blob offset
-  std::uint32_t logits;  // blob offset
-  std::uint32_t needs;
-  std::uint32_t ids;     // blob offset, rows token ids
-};
-struct ServeCmd {
-  std::uint32_t n;
-  ServeItem items[8];
-};
-static_assert(sizeof(ServeItem) == 24, "ServeItem ABI changed");
-static_assert(offsetof(ServeItem, rows) == 0, "ServeItem.rows ABI changed");
-static_assert(offsetof(ServeItem, pos) == 4, "ServeItem.pos ABI changed");
-static_assert(offsetof(ServeItem, ptab) == 8, "ServeItem.ptab ABI changed");
-static_assert(offsetof(ServeItem, logits) == 12, "ServeItem.logits ABI changed");
-static_assert(offsetof(ServeItem, needs) == 16, "ServeItem.needs ABI changed");
-static_assert(offsetof(ServeItem, ids) == 20, "ServeItem.ids ABI changed");
-static_assert(sizeof(ServeCmd) == 4 + 8 * 24, "ServeCmd ABI changed");
-static_assert(offsetof(ServeCmd, items) == 4, "ServeCmd.items ABI changed");
-static_assert(alignof(ServeCmd) == 4, "ServeCmd alignment changed");
-static_assert(serve_abi::kCmd >= mb::kSCRATCH_END,
-              "serve scratch must not overlap the model/KV blob");
-static_assert(serve_abi::kPT >= serve_abi::kCmd + sizeof(ServeCmd),
-              "page tables overlap ServeCmd");
-static_assert(serve_abi::kAbi >= serve_abi::kCmd + sizeof(ServeCmd),
-              "ABI handshake overlaps ServeCmd");
-static_assert(serve_abi::kAbi + 4 <= serve_abi::kPT,
-              "ABI handshake overlaps page tables");
-static_assert(serve_abi::kLogits >= serve_abi::kPT + 8 * 16,
-              "logits overlap page tables");
-static_assert(serve_abi::kIds >= serve_abi::kLogits + 8L * mb::kVocab * 4,
-              "ids overlap logits");
-static_assert(serve_abi::kEnd >= serve_abi::kIds + 8 * 32 * 4,
-              "ids do not fit in scratch");
-static_assert(serve_abi::kLogits % 4 == 0, "logits buffer must be 4-byte aligned");
-static_assert(serve_abi::kEnd > serve_abi::kLogits, "scratch layout is empty");
-} // namespace
 
 int main() {
   std::uintptr_t base;

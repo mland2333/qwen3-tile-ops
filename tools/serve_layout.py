@@ -12,6 +12,7 @@ Layout (all offsets are relative to the start of the model blob):
       ptab       8*32 B   one 16-entry page table per item slot
       logits    8*Vocab*4 per-item logits, written directly by lm_head
       ids        8*32*4   per-item token-id slot (no shared ids[pos] race)
+      cos/sin    32*Half*4 per-row rope tables for a batch Q/K GEMM
       [debug]    sentinel, snap, dump, before
 
 The production guest only touches cmd/ptab/logits.  Debug buffers exist only
@@ -42,6 +43,9 @@ CPP_NAMES = {
     "logits_bytes": "LogitsBytes",
     "ids": "Ids",
     "ids_bytes": "IdsBytes",
+    "cos": "Cos",
+    "sin": "Sin",
+    "cos_bytes": "CosBytes",
     "end": "End",
     "sentinel": "Sentinel",
     "snap": "Snap",
@@ -76,6 +80,10 @@ def layout(header: dict[str, int], debug: bool = False) -> dict[str, int]:
     logits_bytes = ITEMS * vocab * 4
     ids = logits + logits_bytes
     ids_bytes = ITEMS * ID_SLOT_BYTES
+    half = int(header["kHalf"])
+    cos = ids + ids_bytes
+    cos_bytes = 32 * half * 4
+    sin = cos + cos_bytes
     result: dict[str, int] = {
         "scratch": scratch,
         "cmd": cmd,
@@ -85,7 +93,10 @@ def layout(header: dict[str, int], debug: bool = False) -> dict[str, int]:
         "logits_bytes": logits_bytes,
         "ids": ids,
         "ids_bytes": ids_bytes,
-        "end": ids + ids_bytes,
+        "cos": cos,
+        "sin": sin,
+        "cos_bytes": cos_bytes,
+        "end": sin + cos_bytes,
     }
     if not debug:
         return result

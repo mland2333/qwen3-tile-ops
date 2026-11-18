@@ -46,7 +46,7 @@ TARGET  := --target=riscv64-unknown-elf -march=rv64im_xaicore -mabi=lp64 \
 INC     := -I include -I $(VDIR) -I config
 KERNELS := $(wildcard kernels/*.h)
 
-.PHONY: all data big bridge check chat small value-ops group-gemm paged-attn engine-test asm serve serve-debug serve-test serve-debug-test serve-test-long serve-test-pages clean help
+.PHONY: all data big bridge check chat small value-ops group-gemm paged-attn engine-test asm serve serve-debug serve-test serve-debug-test serve-test-long serve-test-pages serve-batch serve-batch-test serve-batch-test-long serve-batch-test-pages clean help
 
 all: big
 
@@ -157,7 +157,7 @@ $(LAYOUT): $(HDR) tools/serve_layout.py
 	@mkdir -p $(VDIR)
 	python3 tools/serve_layout.py --header $(HDR) --cpp $@
 
-$(BUILD)/serve.bin: src/serve.cpp $(KERNELS) include/tile.h $(HDR) $(LAYOUT) $(BUILD)/crt0.o
+$(BUILD)/serve.bin: src/serve.cpp src/serve_abi.h src/serve_views.h $(KERNELS) include/tile.h $(HDR) $(LAYOUT) $(BUILD)/crt0.o
 	@mkdir -p $(BUILD)
 	$(CLANG) $(TARGET) -mcmodel=medany $(INC) -c $< -o $(BUILD)/serve_main.o
 	$(CROSS)objcopy --remove-section=.riscv.attributes $(BUILD)/serve_main.o \
@@ -170,7 +170,7 @@ serve: $(BUILD)/serve.bin
 	@echo "serve: $@"
 
 # Debug guest: same forward path plus sentinel/snap/dump/before scaffolding.
-$(BUILD)/serve_debug.bin: src/serve.cpp $(KERNELS) include/tile.h $(HDR) $(LAYOUT) $(BUILD)/crt0.o
+$(BUILD)/serve_debug.bin: src/serve.cpp src/serve_abi.h src/serve_views.h $(KERNELS) include/tile.h $(HDR) $(LAYOUT) $(BUILD)/crt0.o
 	@mkdir -p $(BUILD)
 	$(CLANG) $(TARGET) -mcmodel=medany -DYAI_SERVE_DEBUG $(INC) -c $< \
 	    -o $(BUILD)/serve_debug_main.o
@@ -205,6 +205,34 @@ serve-debug-test: $(BUILD)/serve_debug.bin $(BRIDGE) $(DATA) $(HDR)
 	python3 tools/debug_serve.py --blob $(DATA) --header $(HDR) \
 	    --guest $(BUILD)/serve_debug.bin --bridge $(BRIDGE) \
 	    --workdir $(abspath $(BUILD)/serve_debug)
+
+# ---- route B: batch QKV/O/MLP guest --------------------------------------
+$(BUILD)/serve_batch.bin: src/serve_batch.cpp src/serve_abi.h src/serve_views.h $(KERNELS) include/tile.h $(HDR) $(LAYOUT) $(BUILD)/crt0.o
+	@mkdir -p $(BUILD)
+	$(CLANG) $(TARGET) -mcmodel=medany $(INC) -c $< -o $(BUILD)/serve_batch_main.o
+	$(CROSS)objcopy --remove-section=.riscv.attributes $(BUILD)/serve_batch_main.o \
+	    $(BUILD)/serve_batch_main.o.link
+	$(CROSS)ld -T $(LINK_LD) $(BUILD)/serve_batch_main.o.link $(BUILD)/crt0.o \
+	    -o $(BUILD)/serve_batch.elf
+	$(CROSS)objcopy -O binary $(BUILD)/serve_batch.elf $@
+
+serve-batch: $(BUILD)/serve_batch.bin
+	@echo "serve-batch: $@"
+
+serve-batch-test: $(BUILD)/serve_batch.bin $(BRIDGE) $(DATA) $(HDR)
+	python3 tools/run_serve.py --blob $(DATA) --header $(HDR) \
+	    --guest $(BUILD)/serve_batch.bin --bridge $(BRIDGE) \
+	    --workdir $(abspath $(BUILD)/serve_batch_work) --max-new 4 --test
+
+serve-batch-test-long: $(BUILD)/serve_batch.bin $(BRIDGE) $(DATA) $(HDR)
+	python3 tools/serve_tests.py --blob $(DATA) --header $(HDR) \
+	    --guest $(BUILD)/serve_batch.bin --bridge $(BRIDGE) \
+	    --workdir $(abspath $(BUILD)/serve_batch_tests) --case long
+
+serve-batch-test-pages: $(BUILD)/serve_batch.bin $(BRIDGE) $(DATA) $(HDR)
+	python3 tools/serve_tests.py --blob $(DATA) --header $(HDR) \
+	    --guest $(BUILD)/serve_batch.bin --bridge $(BRIDGE) \
+	    --workdir $(abspath $(BUILD)/serve_batch_tests) --case pages
 
 # ---- small end-to-end smoke test ------------------------------------------
 small:
