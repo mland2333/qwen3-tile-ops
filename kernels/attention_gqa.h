@@ -23,6 +23,7 @@
 #include "config.h"
 #include "io.h"
 #include "matrix.h"
+#include "kv_pages.h"
 
 namespace qwen3_ops {
 
@@ -390,6 +391,182 @@ YAI_OP_INLINE void attention_heads_gqa_tokscale(const MatrixView &q8,
           sub_view(o8, qi, qc, nr, hd), sub_view(os, qi, h, nr, 1),
           nr, kv_len,
           causal ? pos0 + static_cast<std::int32_t>(qi) : 0, causal, qk_scale);
+    }
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// Paged KV variant: 32-token pages, page table lookup per KV block.
+// k/v pages are [page][32][kv_heads*head_dim] i8; scales are
+// [page][32][kv_heads] f32. q8 is still [q_rows][heads*head_dim].
+// ---------------------------------------------------------------------------
+YAI_OP_INLINE void attention_head_hd128_blocks_paged(
+    const MatrixView &q8, const MatrixView &q_scale,
+    const PagedKV &kv, std::uint32_t kv_len,
+    const MatrixView &o8, const MatrixView &os,
+    std::uint32_t q_rows, std::int32_t pos0, bool causal, float qk_scale,
+    std::uint32_t k_off, std::uint32_t kv_head) {
+  const std::uint8_t nr = static_cast<std::uint8_t>(q_rows);
+  constexpr std::uint8_t ZB = static_cast<std::uint8_t>(kBlock);
+  const std::uint32_t hd = static_cast<std::uint32_t>(kHeadDim128);
+
+  Vec32 qsv{};
+  load_vec_n(qsv, q_scale, 0, nr);
+  Vec32 maximum{};
+  init_f32_vec(maximum, nr);
+  maximum.fill(-3.402823466e+38F);
+  Vec32 den{};
+  init_f32_vec(den, nr);
+  den.fill(0.0f);
+  Acc r0{}, r1{}, r2{}, r3{};
+  init_f32_acc_zero(r0, nr, ZB);
+  init_f32_acc_zero(r1, nr, ZB);
+  init_f32_acc_zero(r2, nr, ZB);
+  init_f32_acc_zero(r3, nr, ZB);
+
+  Tile qt{};
+  config_tile(qt, q8);
+  set_zone(qt, nr, ZB);
+  const MatrixView kview{kv.k + k_off,
+                         static_cast<std::int32_t>(kv.row_bytes), 1,
+                         kv_len, hd, kDtI8};
+  const MatrixView vview{kv.v + k_off, 1,
+                         static_cast<std::int32_t>(kv.row_bytes), hd, 1, kDtI8};
+  Tile kt{};
+  config_tile(kt, kview);
+  Tile vt{};
+  config_tile(vt, vview);
+  Vec32 ksv{};
+  ksv.set_dtype(Vec32DType::F32);
+  ksv.set_stride(kv.scale_row_bytes);
+  Vec32 vsv{};
+  vsv.set_dtype(Vec32DType::F32);
+  vsv.set_stride(kv.scale_row_bytes);
+  Acc part{};
+  part.set_strides(q8.row_bytes, q8.col_bytes);
+  set_zone(part, nr, ZB);
+  Acc s{};
+  Vec32 ones{};
+  config_ones(ones);
+  Tile pt{};
+  pt.set_dtype(TileDType::I8);
+
+  std::uint32_t kv_end = kv_len;
+  if (causal) {
+    const std::uint32_t need = static_cast<std::uint32_t>(pos0) + q_rows;
+    if (need < kv_end) kv_end = need;
+  }
+  for (std::uint32_t j = 0; j < kv_end; j += kBlock) {
+    const std::uint8_t nc = block_zone(kv_len, j);
+    const std::uint32_t page = kv.table[j / kv.page_tokens];
+    const std::uint32_t slot = j % kv.page_tokens;
+    std::byte *kbase = kv.k + k_off + page * kv.page_bytes + slot * kv.row_bytes;
+    std::byte *vbase = kv.v + k_off + page * kv.page_bytes + slot * kv.row_bytes;
+    std::byte *ksbase = kv.ks + kv_head * 4 + page * kv.scale_page_bytes +
+                        slot * kv.scale_row_bytes;
+    std::byte *vsbase = kv.vs + kv_head * 4 + page * kv.scale_page_bytes +
+                        slot * kv.scale_row_bytes;
+    const MatrixView vpage{vbase, 1, static_cast<std::int32_t>(kv.row_bytes), hd, 1, kDtI8};
+
+    s.set_dtype(AccDType::I32);
+    set_zone(s, nr, nc);
+    set_zone(kt, nc, ZB);
+    #pragma clang loop YAI_LOOP_UNROLL
+    for (std::uint32_t d = 0; d < hd; d += kBlock) {
+      load_tile_at(qt, q8.data + d * static_cast<std::uint32_t>(q8.col_bytes));
+      load_tile_at(kt, kbase + d);
+      qt.matmul(kt, s, /*zero=*/d == 0, /*lt=*/false, /*rt=*/true);
+    }
+
+    set_len(ksv, nc);
+    load_vec_at(ksv, ksbase);
+    Acc sf{};
+    init_f32_acc(sf, nr, nc);
+    adequant(sf, s, ksv, qsv);
+    sf.mul_(qk_scale);
+
+    if (causal) {
+      sf.mask_(pos0 - static_cast<std::int32_t>(j));
+    }
+
+    Vec32 nmm = sf.row_max();
+    nmm.max_(maximum);
+    Vec32 corr = maximum.sub(nmm);
+    corr.exp_();
+    den.mul_(corr);
+    r0.mul_(corr, true);
+    r1.mul_(corr, true);
+    r2.mul_(corr, true);
+    r3.mul_(corr, true);
+    sf.sub_(nmm, true);
+    sf.exp_();
+    sf.row_sum(den);
+    maximum.copy(nmm);
+
+    set_len(vsv, nc);
+    load_vec_at(vsv, vsbase);
+    sf.mul_(vsv, false);
+    Vec32 pmax = sf.row_absmax();
+    pmax.mul_(kInv127);
+    set_zone(pt, nr, nc);
+    sf.quant_ext(pmax, pt);
+
+    set_zone(vt, ZB, nc);
+    pv_block(r0, pt, vt, part, vpage, 0, 0 * kBlock, pmax, ones, nr);
+    pv_block(r1, pt, vt, part, vpage, 0, 1 * kBlock, pmax, ones, nr);
+    pv_block(r2, pt, vt, part, vpage, 0, 2 * kBlock, pmax, ones, nr);
+    pv_block(r3, pt, vt, part, vpage, 0, 3 * kBlock, pmax, ones, nr);
+  }
+
+  den.rcp_();
+  r0.mul_(den, true);
+  r1.mul_(den, true);
+  r2.mul_(den, true);
+  r3.mul_(den, true);
+
+  Vec32 m0 = r0.row_absmax();
+  Vec32 m1 = r1.row_absmax();
+  Vec32 m2 = r2.row_absmax();
+  Vec32 m3 = r3.row_absmax();
+  Vec32 m = m0.max(m1).max(m2.max(m3));
+  m.mul_(kInv127);
+  m.set_stride(os.row_bytes);
+  Tile ot{};
+  config_tile(ot, o8);
+  set_zone(ot, nr, ZB);
+  r0.quant_ext(m, ot);
+  store_tile_at(ot, o8.data + 0 * ZB * static_cast<std::uint32_t>(o8.col_bytes));
+  r1.quant_ext(m, ot);
+  store_tile_at(ot, o8.data + 1 * ZB * static_cast<std::uint32_t>(o8.col_bytes));
+  r2.quant_ext(m, ot);
+  store_tile_at(ot, o8.data + 2 * ZB * static_cast<std::uint32_t>(o8.col_bytes));
+  r3.quant_ext(m, ot);
+  store_tile_at(ot, o8.data + 3 * ZB * static_cast<std::uint32_t>(o8.col_bytes));
+  store_vec_at(m, os.data);
+}
+
+YAI_OP_INLINE void attention_heads_gqa_tokscale_paged(
+    const MatrixView &q8, const MatrixView &q_scale, const PagedKV &kv,
+    std::uint32_t kv_len, const MatrixView &o8, const MatrixView &os,
+    int heads, int kv_heads, int head_dim, bool causal, float qk_scale) {
+  const int group = heads / kv_heads;
+  const std::uint32_t q_rows = q8.rows;
+  const std::int32_t pos0 =
+      causal ? static_cast<std::int32_t>(kv_len) - static_cast<std::int32_t>(q_rows) : 0;
+  for (int h = 0; h < heads; ++h) {
+    const int kvh = h / group;
+    const std::uint32_t qc = static_cast<std::uint32_t>(h * head_dim);
+    const std::uint32_t kvc = static_cast<std::uint32_t>(kvh * head_dim);
+    const std::uint32_t hd = static_cast<std::uint32_t>(head_dim);
+    for (std::uint32_t qi = 0; qi < q_rows; qi += kBlock) {
+      const std::uint8_t nr = block_zone(q_rows, qi);
+      const MatrixView qs_h = sub_view(q_scale, qi, h, nr, 1);
+      attention_head_hd128_blocks_paged(
+          sub_view(q8, qi, qc, nr, hd), qs_h, kv, kv_len,
+          sub_view(o8, qi, qc, nr, hd), sub_view(os, qi, h, nr, 1),
+          nr, causal ? pos0 + static_cast<std::int32_t>(qi) : 0, causal,
+          qk_scale, kvc, static_cast<std::uint32_t>(kvh));
     }
   }
 }

@@ -45,7 +45,7 @@ TARGET  := --target=riscv64-unknown-elf -march=rv64im_xaicore -mabi=lp64 \
 INC     := -I include -I $(VDIR) -I config
 KERNELS := $(wildcard kernels/*.h)
 
-.PHONY: all data big bridge check chat small value-ops group-gemm asm clean help
+.PHONY: all data big bridge check chat small value-ops group-gemm paged-attn engine-test asm clean help
 
 all: big
 
@@ -194,6 +194,23 @@ $(BUILD)/gate_up.bin: tests/guest/gate_up.cpp include/tile.h kernels/group_gemm.
 
 gate-up: $(BUILD)/gate_up.bin $(BRIDGE)
 	python3 tools/check_gate_up.py --guest $(BUILD)/gate_up.bin --bridge $(BRIDGE)
+
+# ---- paged attention primitive test ---------------------------------------
+$(BUILD)/paged_attn.bin: tests/guest/paged_attn.cpp include/tile.h kernels/attention_gqa.h kernels/kv_pages.h $(BUILD)/crt0.o
+	@mkdir -p $(BUILD)
+	$(CLANG) $(TARGET) -mcmodel=medany $(INC) -c $< -o $(BUILD)/paged_attn_main.o
+	$(CROSS)objcopy --remove-section=.riscv.attributes $(BUILD)/paged_attn_main.o \
+	    $(BUILD)/paged_attn_main.o.link
+	$(CROSS)ld -T $(LINK_LD) $(BUILD)/paged_attn_main.o.link $(BUILD)/crt0.o \
+	    -o $(BUILD)/paged_attn.elf
+	$(CROSS)objcopy -O binary $(BUILD)/paged_attn.elf $@
+
+paged-attn: $(BUILD)/paged_attn.bin $(BRIDGE)
+	python3 tools/check_paged_attn.py --guest $(BUILD)/paged_attn.bin --bridge $(BRIDGE)
+
+# ---- host engine scaffolding test ---------------------------------------
+engine-test:
+	python3 tools/check_engine.py
 
 # ---- text in / text out ----------------------------------------------------
 chat: $(GUEST) $(BRIDGE) $(HDR) $(DATA)
