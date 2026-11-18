@@ -24,6 +24,7 @@ BUILD   := build
 VARIANT ?= full
 VDIR    := $(BUILD)/$(VARIANT)
 HDR     := $(VDIR)/model_big.h
+LAYOUT  := $(VDIR)/serve_layout.h
 DATA    := $(VDIR)/qwen3_big_data.bin
 REF     := $(VDIR)/ref.npz
 OUT     := $(VDIR)/out.bin
@@ -45,7 +46,7 @@ TARGET  := --target=riscv64-unknown-elf -march=rv64im_xaicore -mabi=lp64 \
 INC     := -I include -I $(VDIR) -I config
 KERNELS := $(wildcard kernels/*.h)
 
-.PHONY: all data big bridge check chat small value-ops group-gemm paged-attn engine-test asm clean help
+.PHONY: all data big bridge check chat small value-ops group-gemm paged-attn engine-test asm serve serve-debug serve-test serve-debug-test serve-test-long serve-test-pages clean help
 
 all: big
 
@@ -150,6 +151,60 @@ $(ASM_DIS): $(ASM_DBG_ELF)
 	@echo "disasm: $@ ($$(stat -c%s $@) bytes)"
 
 asm: $(ASM_TXT) $(ASM_DIS)
+
+# ---- serve: multi-request step guest -------------------------------------
+$(LAYOUT): $(HDR) tools/serve_layout.py
+	@mkdir -p $(VDIR)
+	python3 tools/serve_layout.py --header $(HDR) --cpp $@
+
+$(BUILD)/serve.bin: src/serve.cpp $(KERNELS) include/tile.h $(HDR) $(LAYOUT) $(BUILD)/crt0.o
+	@mkdir -p $(BUILD)
+	$(CLANG) $(TARGET) -mcmodel=medany $(INC) -c $< -o $(BUILD)/serve_main.o
+	$(CROSS)objcopy --remove-section=.riscv.attributes $(BUILD)/serve_main.o \
+	    $(BUILD)/serve_main.o.link
+	$(CROSS)ld -T $(LINK_LD) $(BUILD)/serve_main.o.link $(BUILD)/crt0.o \
+	    -o $(BUILD)/serve.elf
+	$(CROSS)objcopy -O binary $(BUILD)/serve.elf $@
+
+serve: $(BUILD)/serve.bin
+	@echo "serve: $@"
+
+# Debug guest: same forward path plus sentinel/snap/dump/before scaffolding.
+$(BUILD)/serve_debug.bin: src/serve.cpp $(KERNELS) include/tile.h $(HDR) $(LAYOUT) $(BUILD)/crt0.o
+	@mkdir -p $(BUILD)
+	$(CLANG) $(TARGET) -mcmodel=medany -DYAI_SERVE_DEBUG $(INC) -c $< \
+	    -o $(BUILD)/serve_debug_main.o
+	$(CROSS)objcopy --remove-section=.riscv.attributes $(BUILD)/serve_debug_main.o \
+	    $(BUILD)/serve_debug_main.o.link
+	$(CROSS)ld -T $(LINK_LD) $(BUILD)/serve_debug_main.o.link $(BUILD)/crt0.o \
+	    -o $(BUILD)/serve_debug.elf
+	$(CROSS)objcopy -O binary $(BUILD)/serve_debug.elf $@
+
+serve-debug: $(BUILD)/serve_debug.bin
+	@echo "serve-debug: $@"
+
+# Batch decode must produce the same tokens as one request at a time.
+serve-test: $(BUILD)/serve.bin $(BRIDGE) $(DATA) $(HDR)
+	python3 tools/run_serve.py --blob $(DATA) --header $(HDR) \
+	    --guest $(BUILD)/serve.bin --bridge $(BRIDGE) \
+	    --workdir $(abspath $(BUILD)/serve_work) --max-new 4 --test
+
+# Cross-page prefill/decode + scheduler acceptance.
+serve-test-long: $(BUILD)/serve.bin $(BRIDGE) $(DATA) $(HDR)
+	python3 tools/serve_tests.py --blob $(DATA) --header $(HDR) \
+	    --guest $(BUILD)/serve.bin --bridge $(BRIDGE) \
+	    --workdir $(abspath $(BUILD)/serve_tests) --case long
+
+# Page-pool exhaustion / waiting / release / reuse.
+serve-test-pages: $(BUILD)/serve.bin $(BRIDGE) $(DATA) $(HDR)
+	python3 tools/serve_tests.py --blob $(DATA) --header $(HDR) \
+	    --guest $(BUILD)/serve.bin --bridge $(BRIDGE) \
+	    --workdir $(abspath $(BUILD)/serve_tests) --case pages
+
+serve-debug-test: $(BUILD)/serve_debug.bin $(BRIDGE) $(DATA) $(HDR)
+	python3 tools/debug_serve.py --blob $(DATA) --header $(HDR) \
+	    --guest $(BUILD)/serve_debug.bin --bridge $(BRIDGE) \
+	    --workdir $(abspath $(BUILD)/serve_debug)
 
 # ---- small end-to-end smoke test ------------------------------------------
 small:

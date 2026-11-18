@@ -103,6 +103,25 @@ class PagePool:
             req.pages.append(p)
         return True
 
+    def reserve(self, req: Request, n_tokens: int) -> bool:
+        """Atomically reserve all pages for ``n_tokens``.
+
+        Unlike ``ensure``, this never leaves a partially-allocated request
+        behind: if the pool cannot cover the whole reservation, nothing is
+        allocated.  This is what admission control uses to avoid deadlock.
+        """
+        need = (n_tokens + self.page_tokens - 1) // self.page_tokens
+        extra = need - len(req.pages)
+        if extra <= 0:
+            return True
+        if len(self.free) < extra:
+            return False
+        for _ in range(extra):
+            p = self.alloc_page()
+            assert p is not None
+            req.pages.append(p)
+        return True
+
     def release(self, req: Request) -> None:
         for p in req.pages:
             if p in self.used:

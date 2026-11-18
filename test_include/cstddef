@@ -1,4 +1,7 @@
 #pragma once
+
+#define offsetof(type, member) __builtin_offsetof(type, member)
+
 namespace std {
 using size_t = __SIZE_TYPE__;
 enum class byte : unsigned char {};

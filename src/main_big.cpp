@@ -144,7 +144,8 @@ enum class LmHeadOut { None, Logits, Argmax };
 // 一块 token（rows <= kSeq）的完整前向。pos 是本块第一个 token 的绝对位置。
 YAI_ALWAYS_INLINE void forward_chunk(const ModelViews &w, std::uint32_t pos,
                                      std::uint32_t rows, LmHeadOut lm_out,
-                                     bool optimize_tail) {
+                                     bool optimize_tail,
+                                     const unsigned short *ptab) {
   constexpr int H = mb::kHidden;
   constexpr int HD = mb::kHeadDim;
 
@@ -166,9 +167,6 @@ YAI_ALWAYS_INLINE void forward_chunk(const ModelViews &w, std::uint32_t pos,
   }
 
   constexpr std::uint32_t kPageTokens = 32;
-  constexpr std::uint32_t kPages = mb::kMaxSeq / kPageTokens;
-  unsigned short ptab[kPages];
-  for (std::uint32_t p = 0; p < kPages; ++p) ptab[p] = static_cast<unsigned short>(kPages - 1 - p);
 
   for (int L = 0; L < mb::kLayers; ++L) {
     LayerViews lv;
@@ -358,7 +356,12 @@ int main() {
     const LmHeadOut lm_out =
         need_out ? (fused ? LmHeadOut::Argmax : LmHeadOut::Logits)
                  : LmHeadOut::None;
-    forward_chunk(w, pos, rows, lm_out, fused);
+    constexpr std::uint32_t kPageTokens = 32;
+    constexpr std::uint32_t kPages = mb::kMaxSeq / kPageTokens;
+    unsigned short ptab[kPages];
+    for (std::uint32_t p = 0; p < kPages; ++p)
+      ptab[p] = static_cast<unsigned short>(kPages - 1 - p);
+    forward_chunk(w, pos, rows, lm_out, fused, ptab);
     pos += rows;
     if (pos >= n_prompt && pos < total) {
       const std::uint32_t id = fused ? fused_argmax_id(w) : argmax_logits(w);
