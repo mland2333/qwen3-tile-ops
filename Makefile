@@ -212,6 +212,19 @@ paged-attn: $(BUILD)/paged_attn.bin $(BRIDGE)
 engine-test:
 	python3 tools/check_engine.py
 
+# ---- multi-request paged attention test ----------------------------------
+$(BUILD)/paged_attn_multi.bin: tests/guest/paged_attn_multi.cpp include/tile.h kernels/attention_gqa.h kernels/kv_pages.h $(BUILD)/crt0.o
+	@mkdir -p $(BUILD)
+	$(CLANG) $(TARGET) -mcmodel=medany $(INC) -c $< -o $(BUILD)/paged_attn_multi_main.o
+	$(CROSS)objcopy --remove-section=.riscv.attributes $(BUILD)/paged_attn_multi_main.o \
+	    $(BUILD)/paged_attn_multi_main.o.link
+	$(CROSS)ld -T $(LINK_LD) $(BUILD)/paged_attn_multi_main.o.link $(BUILD)/crt0.o \
+	    -o $(BUILD)/paged_attn_multi.elf
+	$(CROSS)objcopy -O binary $(BUILD)/paged_attn_multi.elf $@
+
+paged-attn-multi: $(BUILD)/paged_attn_multi.bin $(BRIDGE)
+	python3 tools/check_paged_attn_multi.py --guest $(BUILD)/paged_attn_multi.bin --bridge $(BRIDGE)
+
 # ---- text in / text out ----------------------------------------------------
 chat: $(GUEST) $(BRIDGE) $(HDR) $(DATA)
 	python3 tools/run_chat.py "$(TEXT)" --max-new $(or $(MAX_NEW),8) \
