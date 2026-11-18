@@ -102,50 +102,62 @@ YAI_OP_INLINE void swiglu_quant_heads(const MatrixView &gate,
 // gate/up acc-level：每个 32 列块先算 gate/up（i32 K 累加 + adequant），
 // 立即在 Acc 上做 silu(g)*u；8 个 32 列块（256 列）一组做 absmax + quant。
 // 不再写 f32 gt/ut。
-YAI_ALWAYS_INLINE void gemm_one_n_block_scaled(
+YAI_ALWAYS_INLINE void gemm_one_block_gate_up(
     const MatrixView &a, const MatrixView &a_scale,
-    const MatrixView &b, const MatrixView &b_scale,
+    const MatrixView &wg, const MatrixView &wgs,
+    const MatrixView &wu, const MatrixView &wus,
     std::uint32_t n, std::uint32_t group_k, std::uint8_t rows,
-    Acc &out, Tile &ta, Tile &tb) {
+    Acc &gate, Acc &up, Tile &ta, Tile &tb) {
   constexpr std::uint8_t ZB = 32;
   const std::uint32_t K = a.cols;
-  Acc part{};
-  part.set_dtype(AccDType::I32);
-  set_zone(part, rows, ZB);
-  Acc pf{};
-  pf.set_dtype(AccDType::F32);
-  set_zone(pf, rows, ZB);
+  Acc part_g{}, part_u{};
+  part_g.set_dtype(AccDType::I32); set_zone(part_g, rows, ZB);
+  part_u.set_dtype(AccDType::I32); set_zone(part_u, rows, ZB);
+  Acc pf_g{}, pf_u{};
+  pf_g.set_dtype(AccDType::F32); set_zone(pf_g, rows, ZB);
+  pf_u.set_dtype(AccDType::F32); set_zone(pf_u, rows, ZB);
   Vec32 asv{};
   asv.set_dtype(Vec32DType::F32);
   asv.set_stride(a_scale.row_bytes);
-  Vec32 ws{};
-  ws.set_dtype(Vec32DType::F32);
-  ws.set_stride(4);
-  set_len(ws, ZB);
-  load_vec_at(ws, b_scale.data + n * 4);
+  Vec32 wgv{}, wuv{};
+  wgv.set_dtype(Vec32DType::F32); wgv.set_stride(4);
+  wuv.set_dtype(Vec32DType::F32); wuv.set_stride(4);
+  set_len(wgv, ZB); set_len(wuv, ZB);
+  load_vec_at(wgv, wgs.data + n * 4);
+  load_vec_at(wuv, wus.data + n * 4);
 
-  out.fill(0.0f);
+  gate.fill(0.0f);
+  up.fill(0.0f);
   for (std::uint32_t k0 = 0; k0 < K; k0 += group_k) {
     const std::uint8_t nc0 = block_zone(K, k0);
+    // A tile is loaded once per K block and reused by gate and up.
     set_zone(ta, rows, nc0);
     load_tile_at(ta, a.data + k0 * static_cast<std::uint32_t>(a.col_bytes));
     set_zone(tb, ZB, nc0);
-    load_tile_at(tb, b.data + n * static_cast<std::uint32_t>(b.row_bytes) +
-                     k0 * static_cast<std::uint32_t>(b.col_bytes));
-    ta.matmul(tb, part, true, false, true);
+    load_tile_at(tb, wg.data + n * static_cast<std::uint32_t>(wg.row_bytes) +
+                     k0 * static_cast<std::uint32_t>(wg.col_bytes));
+    ta.matmul(tb, part_g, true, false, true);
+    load_tile_at(tb, wu.data + n * static_cast<std::uint32_t>(wu.row_bytes) +
+                     k0 * static_cast<std::uint32_t>(wu.col_bytes));
+    ta.matmul(tb, part_u, true, false, true);
     for (std::uint32_t kk = ZB; kk < group_k; kk += ZB) {
       const std::uint8_t nc = block_zone(K, k0 + kk);
       set_zone(ta, rows, nc);
       load_tile_at(ta, a.data + (k0 + kk) * static_cast<std::uint32_t>(a.col_bytes));
       set_zone(tb, ZB, nc);
-      load_tile_at(tb, b.data + n * static_cast<std::uint32_t>(b.row_bytes) +
-                       (k0 + kk) * static_cast<std::uint32_t>(b.col_bytes));
-      ta.matmul(tb, part, false, false, true);
+      load_tile_at(tb, wg.data + n * static_cast<std::uint32_t>(wg.row_bytes) +
+                       (k0 + kk) * static_cast<std::uint32_t>(wg.col_bytes));
+      ta.matmul(tb, part_g, false, false, true);
+      load_tile_at(tb, wu.data + n * static_cast<std::uint32_t>(wu.row_bytes) +
+                       (k0 + kk) * static_cast<std::uint32_t>(wu.col_bytes));
+      ta.matmul(tb, part_u, false, false, true);
     }
     set_len(asv, rows);
     load_vec_at(asv, a_scale.data + (k0 / group_k) * 4);
-    adequant(pf, part, ws, asv);
-    out.add_(pf);
+    adequant(pf_g, part_g, wgv, asv);
+    gate.add_(pf_g);
+    adequant(pf_u, part_u, wuv, asv);
+    up.add_(pf_u);
   }
 }
 
@@ -178,43 +190,43 @@ YAI_OP_INLINE void gemm_gate_up_swiglu_quant(
   init_f32_acc(e, nr, ZB); init_f32_acc(u, nr, ZB);
 
   for (std::uint32_t g0 = 0; g0 < s8.cols; g0 += 256) {
-    gemm_one_n_block_scaled(a, a_scale, wg, wgs, g0 + 0 * ZB, group_k, rows, sw0, ta, tb);
-    gemm_one_n_block_scaled(a, a_scale, wu, wus, g0 + 0 * ZB, group_k, rows, u, ta, tb);
+    gemm_one_block_gate_up(a, a_scale, wg, wgs, wu, wus,
+                           g0 + 0 * ZB, group_k, rows, sw0, u, ta, tb);
     e = sw0.copy(); e.mul_(-1.0f); e.exp_(); e.add_(1.0f); e.rcp_();
     sw0.mul_(e); sw0.mul_(u);
 
-    gemm_one_n_block_scaled(a, a_scale, wg, wgs, g0 + 1 * ZB, group_k, rows, sw1, ta, tb);
-    gemm_one_n_block_scaled(a, a_scale, wu, wus, g0 + 1 * ZB, group_k, rows, u, ta, tb);
+    gemm_one_block_gate_up(a, a_scale, wg, wgs, wu, wus,
+                           g0 + 1 * ZB, group_k, rows, sw1, u, ta, tb);
     e = sw1.copy(); e.mul_(-1.0f); e.exp_(); e.add_(1.0f); e.rcp_();
     sw1.mul_(e); sw1.mul_(u);
 
-    gemm_one_n_block_scaled(a, a_scale, wg, wgs, g0 + 2 * ZB, group_k, rows, sw2, ta, tb);
-    gemm_one_n_block_scaled(a, a_scale, wu, wus, g0 + 2 * ZB, group_k, rows, u, ta, tb);
+    gemm_one_block_gate_up(a, a_scale, wg, wgs, wu, wus,
+                           g0 + 2 * ZB, group_k, rows, sw2, u, ta, tb);
     e = sw2.copy(); e.mul_(-1.0f); e.exp_(); e.add_(1.0f); e.rcp_();
     sw2.mul_(e); sw2.mul_(u);
 
-    gemm_one_n_block_scaled(a, a_scale, wg, wgs, g0 + 3 * ZB, group_k, rows, sw3, ta, tb);
-    gemm_one_n_block_scaled(a, a_scale, wu, wus, g0 + 3 * ZB, group_k, rows, u, ta, tb);
+    gemm_one_block_gate_up(a, a_scale, wg, wgs, wu, wus,
+                           g0 + 3 * ZB, group_k, rows, sw3, u, ta, tb);
     e = sw3.copy(); e.mul_(-1.0f); e.exp_(); e.add_(1.0f); e.rcp_();
     sw3.mul_(e); sw3.mul_(u);
 
-    gemm_one_n_block_scaled(a, a_scale, wg, wgs, g0 + 4 * ZB, group_k, rows, sw4, ta, tb);
-    gemm_one_n_block_scaled(a, a_scale, wu, wus, g0 + 4 * ZB, group_k, rows, u, ta, tb);
+    gemm_one_block_gate_up(a, a_scale, wg, wgs, wu, wus,
+                           g0 + 4 * ZB, group_k, rows, sw4, u, ta, tb);
     e = sw4.copy(); e.mul_(-1.0f); e.exp_(); e.add_(1.0f); e.rcp_();
     sw4.mul_(e); sw4.mul_(u);
 
-    gemm_one_n_block_scaled(a, a_scale, wg, wgs, g0 + 5 * ZB, group_k, rows, sw5, ta, tb);
-    gemm_one_n_block_scaled(a, a_scale, wu, wus, g0 + 5 * ZB, group_k, rows, u, ta, tb);
+    gemm_one_block_gate_up(a, a_scale, wg, wgs, wu, wus,
+                           g0 + 5 * ZB, group_k, rows, sw5, u, ta, tb);
     e = sw5.copy(); e.mul_(-1.0f); e.exp_(); e.add_(1.0f); e.rcp_();
     sw5.mul_(e); sw5.mul_(u);
 
-    gemm_one_n_block_scaled(a, a_scale, wg, wgs, g0 + 6 * ZB, group_k, rows, sw6, ta, tb);
-    gemm_one_n_block_scaled(a, a_scale, wu, wus, g0 + 6 * ZB, group_k, rows, u, ta, tb);
+    gemm_one_block_gate_up(a, a_scale, wg, wgs, wu, wus,
+                           g0 + 6 * ZB, group_k, rows, sw6, u, ta, tb);
     e = sw6.copy(); e.mul_(-1.0f); e.exp_(); e.add_(1.0f); e.rcp_();
     sw6.mul_(e); sw6.mul_(u);
 
-    gemm_one_n_block_scaled(a, a_scale, wg, wgs, g0 + 7 * ZB, group_k, rows, sw7, ta, tb);
-    gemm_one_n_block_scaled(a, a_scale, wu, wus, g0 + 7 * ZB, group_k, rows, u, ta, tb);
+    gemm_one_block_gate_up(a, a_scale, wg, wgs, wu, wus,
+                           g0 + 7 * ZB, group_k, rows, sw7, u, ta, tb);
     e = sw7.copy(); e.mul_(-1.0f); e.exp_(); e.add_(1.0f); e.rcp_();
     sw7.mul_(e); sw7.mul_(u);
 
