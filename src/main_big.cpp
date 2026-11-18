@@ -224,11 +224,23 @@ YAI_ALWAYS_INLINE void forward_chunk(const ModelViews &w, std::uint32_t pos,
     gemm_nt_group_store(h8t, hst, lv.wq, lv.wqs, qt, 256, nullptr, &q8t, &qst,
                         &lv.nq, &cos_t, &sin_t, 1.0f / HD);
 
-    // attention：KV 长度 = pos + rows（本 chunk 的 K/V 已全部写进 cache）
+    // attention：KV 长度 = pos + rows。
+    // 单请求先用 identity page table 走 paged attention：page=32 token，
+    // 与当前连续 cache 布局一一对应；多请求时 page table 指向共享 page pool，
+    // K/V 写入改为按 request page 直接写或 scatter。
     const std::uint32_t kv_len = pos + rows;
-    attention_heads_gqa_tokscale(
-        q8t, rows_of(lv.kcache, 0, kv_len), rows_of(lv.vcache, 0, kv_len),
-        qst, lv.kcscale, lv.vcscale, o8t, ost, mb::kHeads, mb::kKvHeads, HD,
+    constexpr std::uint32_t kPageTokens = 32;
+    constexpr std::uint32_t kPages = mb::kMaxSeq / kPageTokens;
+    unsigned short ptab[kPages];
+    for (std::uint32_t p = 0; p < kPages; ++p) ptab[p] = static_cast<unsigned short>(p);
+    const std::uint32_t kv_row = static_cast<std::uint32_t>(lv.kcache.row_bytes);
+    const std::uint32_t ks_row = static_cast<std::uint32_t>(lv.kcscale.row_bytes);
+    PagedKV paged{lv.kcache.data, lv.vcache.data, lv.kcscale.data,
+                  lv.vcscale.data, ptab, kPageTokens,
+                  kPageTokens * kv_row, kv_row,
+                  kPageTokens * ks_row, ks_row};
+    attention_heads_gqa_tokscale_paged(
+        q8t, qst, paged, kv_len, o8t, ost, mb::kHeads, mb::kKvHeads, HD,
         /*causal=*/true, /*qk_scale=*/kInvSqrt128);
 
     gemm_nt_group_store(o8t, ost, lv.wo, lv.wos, ot, 128, &xt);
