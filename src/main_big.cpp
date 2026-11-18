@@ -165,6 +165,11 @@ YAI_ALWAYS_INLINE void forward_chunk(const ModelViews &w, std::uint32_t pos,
     embedding_rmsnorm_rows(w.emb, w.emb_s, ids_p, x, n1_0, h, 1.0f / H);
   }
 
+  constexpr std::uint32_t kPageTokens = 32;
+  constexpr std::uint32_t kPages = mb::kMaxSeq / kPageTokens;
+  unsigned short ptab[kPages];
+  for (std::uint32_t p = 0; p < kPages; ++p) ptab[p] = static_cast<unsigned short>(kPages - 1 - p);
+
   for (int L = 0; L < mb::kLayers; ++L) {
     LayerViews lv;
     make_layer_views(lv, w.blob, L);
@@ -179,14 +184,27 @@ YAI_ALWAYS_INLINE void forward_chunk(const ModelViews &w, std::uint32_t pos,
     // attention 要用。K/V 写完之前不能停。
     const MatrixView kk = rows_of(w.k, 0, rows);
     const MatrixView vv = rows_of(w.v, 0, rows);
-    MatrixView vc8 = rows_of(lv.vcache, pos, rows);
-    MatrixView vcs = rows_of(lv.vcscale, pos, rows);
+    const std::uint32_t kv_row = static_cast<std::uint32_t>(lv.kcache.row_bytes);
+    const std::uint32_t ks_row = static_cast<std::uint32_t>(lv.kcscale.row_bytes);
+    const std::uint32_t kv_page_bytes = kPageTokens * kv_row;
+    const std::uint32_t ks_page_bytes = kPageTokens * ks_row;
+    const std::uint32_t page = ptab[pos / kPageTokens];
+    const std::uint32_t slot = pos % kPageTokens;
+    const std::uint32_t koff = page * kv_page_bytes + slot * kv_row;
+    const std::uint32_t soff = page * ks_page_bytes + slot * ks_row;
+    // K/V 直接写物理 page，不经过连续 staging + scatter。
+    MatrixView vc8{lv.vcache.data + koff, static_cast<std::int32_t>(kv_row), 1,
+                   rows, static_cast<std::uint32_t>(mb::kKvHeads * HD), kDtI8};
+    MatrixView vcs{lv.vcscale.data + soff, static_cast<std::int32_t>(ks_row), 4,
+                   rows, mb::kKvHeads, kDtF32};
     gemm_nt_group_store(h8, hs, lv.wv, lv.wvs, vv, 256, nullptr, &vc8, &vcs);
 
     // K：GEMM 写一次 f32 k，norm/rope/quant 读一次；没有额外存储，
     // 保留 norm/rope 融合，避免中间 f32 往返。
-    MatrixView kc = rows_of(lv.kcache, pos, rows);
-    MatrixView kcs = rows_of(lv.kcscale, pos, rows);
+    MatrixView kc{lv.kcache.data + koff, static_cast<std::int32_t>(kv_row), 1,
+                  rows, static_cast<std::uint32_t>(mb::kKvHeads * HD), kDtI8};
+    MatrixView kcs{lv.kcscale.data + soff, static_cast<std::int32_t>(ks_row), 4,
+                   rows, mb::kKvHeads, kDtF32};
     gemm_nt_group_store(h8, hs, lv.wk, lv.wks, kk, 256, nullptr, &kc, &kcs,
                         &lv.nk, &cos_p, &sin_p, 1.0f / HD);
     // V 的 GEMM 输出已经在 epilogue 里 per-head 量化并写进 KV cache。
@@ -224,17 +242,8 @@ YAI_ALWAYS_INLINE void forward_chunk(const ModelViews &w, std::uint32_t pos,
     gemm_nt_group_store(h8t, hst, lv.wq, lv.wqs, qt, 256, nullptr, &q8t, &qst,
                         &lv.nq, &cos_t, &sin_t, 1.0f / HD);
 
-    // attention：KV 长度 = pos + rows。
-    // 单请求先用 identity page table 走 paged attention：page=32 token，
-    // 与当前连续 cache 布局一一对应；多请求时 page table 指向共享 page pool，
-    // K/V 写入改为按 request page 直接写或 scatter。
+    // attention：K/V 已按 ptab 直接写进物理 page。
     const std::uint32_t kv_len = pos + rows;
-    constexpr std::uint32_t kPageTokens = 32;
-    constexpr std::uint32_t kPages = mb::kMaxSeq / kPageTokens;
-    unsigned short ptab[kPages];
-    for (std::uint32_t p = 0; p < kPages; ++p) ptab[p] = static_cast<unsigned short>(p);
-    const std::uint32_t kv_row = static_cast<std::uint32_t>(lv.kcache.row_bytes);
-    const std::uint32_t ks_row = static_cast<std::uint32_t>(lv.kcscale.row_bytes);
     PagedKV paged{lv.kcache.data, lv.vcache.data, lv.kcscale.data,
                   lv.vcscale.data, ptab, kPageTokens,
                   kPageTokens * kv_row, kv_row,

@@ -125,6 +125,11 @@ def main() -> int:
     ap.add_argument("--layers", type=int, default=0)
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument(
+        "--paged",
+        action="store_true",
+        help="KV cache is stored in physical page order; skip kc/ks/vc/vs stages",
+    )
+    ap.add_argument(
         "--fused",
         action="store_true",
         help="production path fuses lm_head+argmax: skip the logits stage, "
@@ -158,6 +163,9 @@ def main() -> int:
             continue
         if name == "v":
             print("skip v (V GEMM quantised in the epilogue)")
+            continue
+        if args.paged and name in ("kc", "ks", "vc", "vs"):
+            print(f"skip {name} (paged KV cache is in physical page order)")
             continue
         if name in ("g", "u"):
             print(f"skip {name} (gate/up GEMM quantised in the epilogue)")

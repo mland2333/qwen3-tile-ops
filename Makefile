@@ -105,9 +105,9 @@ check: $(GUEST) $(BRIDGE) $(DATA) $(REF) $(HDR)
 	        --mode-only --mode $$mode; \
 	    ./$(BRIDGE) $(GUEST) $(CHECK_BLOB) $(OUT); \
 	    if [ $$mode -eq 0 ]; then \
-	        python3 tools/compare.py --header $(HDR) --out $(OUT) --ref $(REF) --fused; \
+	        python3 tools/compare.py --header $(HDR) --out $(OUT) --ref $(REF) --fused --paged; \
 	    else \
-	        python3 tools/compare.py --header $(HDR) --out $(OUT) --ref $(REF); \
+	        python3 tools/compare.py --header $(HDR) --out $(OUT) --ref $(REF) --paged; \
 	    fi; \
 	done
 
