@@ -93,6 +93,43 @@ YAI_OP_INLINE void paged_kv_scatter(const MatrixView &k,
   }
 }
 
+
+// Batch scatter: row r uses tables[r] / tokens[r].  Word copies, not byte loops.
+YAI_OP_INLINE void paged_kv_scatter_batch(
+    const MatrixView &k, const MatrixView &v,
+    const MatrixView &ks, const MatrixView &vs,
+    const PagedKV *const *tables, const std::uint32_t *tokens,
+    std::uint32_t rows, std::uint32_t kv_dim, std::uint32_t kv_heads) {
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    const PagedKV &kv = *tables[r];
+    const std::uint32_t tok = tokens[r];
+    std::byte *dk = paged_k_base(kv, tok);
+    std::byte *dv = paged_v_base(kv, tok);
+    std::byte *dks = paged_ks_base(kv, tok);
+    std::byte *dvs = paged_vs_base(kv, tok);
+    const std::byte *sk = k.data + r * static_cast<std::uint32_t>(k.row_bytes);
+    const std::byte *sv = v.data + r * static_cast<std::uint32_t>(v.row_bytes);
+    auto *dk32 = reinterpret_cast<std::uint32_t *>(dk);
+    auto *dv32 = reinterpret_cast<std::uint32_t *>(dv);
+    const auto *sk32 = reinterpret_cast<const std::uint32_t *>(sk);
+    const auto *sv32 = reinterpret_cast<const std::uint32_t *>(sv);
+    for (std::uint32_t i = 0; i < kv_dim / 4; ++i) {
+      dk32[i] = sk32[i];
+      dv32[i] = sv32[i];
+    }
+    auto *dks32 = reinterpret_cast<std::uint32_t *>(dks);
+    auto *dvs32 = reinterpret_cast<std::uint32_t *>(dvs);
+    const auto *sks32 = reinterpret_cast<const std::uint32_t *>(
+        ks.data + r * static_cast<std::uint32_t>(ks.row_bytes));
+    const auto *svs32 = reinterpret_cast<const std::uint32_t *>(
+        vs.data + r * static_cast<std::uint32_t>(vs.row_bytes));
+    for (std::uint32_t h = 0; h < kv_heads; ++h) {
+      dks32[h] = sks32[h];
+      dvs32[h] = svs32[h];
+    }
+  }
+}
+
 } // namespace qwen3_ops
 
 #endif

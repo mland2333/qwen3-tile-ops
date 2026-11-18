@@ -225,6 +225,19 @@ $(BUILD)/paged_attn_multi.bin: tests/guest/paged_attn_multi.cpp include/tile.h k
 paged-attn-multi: $(BUILD)/paged_attn_multi.bin $(BRIDGE)
 	python3 tools/check_paged_attn_multi.py --guest $(BUILD)/paged_attn_multi.bin --bridge $(BRIDGE)
 
+# ---- batch K/V scatter test -----------------------------------------------
+$(BUILD)/paged_kv_batch.bin: tests/guest/paged_kv_batch.cpp include/tile.h kernels/kv_pages.h $(BUILD)/crt0.o
+	@mkdir -p $(BUILD)
+	$(CLANG) $(TARGET) -mcmodel=medany $(INC) -c $< -o $(BUILD)/paged_kv_batch_main.o
+	$(CROSS)objcopy --remove-section=.riscv.attributes $(BUILD)/paged_kv_batch_main.o \
+	    $(BUILD)/paged_kv_batch_main.o.link
+	$(CROSS)ld -T $(LINK_LD) $(BUILD)/paged_kv_batch_main.o.link $(BUILD)/crt0.o \
+	    -o $(BUILD)/paged_kv_batch.elf
+	$(CROSS)objcopy -O binary $(BUILD)/paged_kv_batch.elf $@
+
+paged-kv-batch: $(BUILD)/paged_kv_batch.bin $(BRIDGE)
+	python3 tools/check_paged_kv_batch.py --guest $(BUILD)/paged_kv_batch.bin --bridge $(BRIDGE)
+
 # ---- text in / text out ----------------------------------------------------
 chat: $(GUEST) $(BRIDGE) $(HDR) $(DATA)
 	python3 tools/run_chat.py "$(TEXT)" --max-new $(or $(MAX_NEW),8) \
